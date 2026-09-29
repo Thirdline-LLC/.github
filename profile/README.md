@@ -10,7 +10,7 @@ A student-run software studio in Washington, DC. We take problems apart and buil
 
 - **Start with the problem.** Talk to the people who feel it, break it into pieces, and ship the smallest thing that fixes the first piece.
 - **Specs before code.** Every change starts as a written spec and a ticket, then goes through a pull request, review and CI before it merges.
-- **Student data stays put.** School tools keep records on the device or in the school's own systems. None of it goes into our repositories.
+- **PII data stays put.** School tools keep records on the device or in the school's own systems. None of it goes into our repositories.
 
 ### Contact
 
