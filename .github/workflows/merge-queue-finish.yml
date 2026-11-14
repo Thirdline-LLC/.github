@@ -199,11 +199,21 @@ jobs:
               else
                 required=$(required_contexts)
                 check_required "$cur_head"
-                case "$checks_state" in
-                  failure) reason="A required check failed on this PR: $failed_checks. Fix it, then add the \`$LABEL\` label again." ;;
-                  pending) reason="This PR's checks hadn't passed yet. Add the \`$LABEL\` label again once they pass." ;;
-                  *) reason="The queue couldn't check this PR. Add the \`$LABEL\` label again to retry." ;;
-                esac
+                base_now=$(gh api "repos/$REPO/git/ref/heads/$(uri "$base_branch")" --jq .object.sha)
+                compare=$(gh api "repos/$REPO/compare/$base_now...$cur_head")
+                touches_workflows=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[].filename' \
+                  | grep -c '^\.github/workflows/' || true)
+                if [ "$checks_state" = failure ]; then
+                  reason="A required check failed on this PR: $failed_checks. Fix it, then add the \`$LABEL\` label again."
+                elif [ "$checks_state" = pending ]; then
+                  reason="This PR's checks hadn't passed yet. Add the \`$LABEL\` label again once they pass."
+                elif [ "$(jq -r .ahead_by <<< "$compare")" = 0 ]; then
+                  reason="Everything in this PR is already in $base_branch, so there is nothing to merge."
+                elif [ "${touches_workflows:-0}" -gt 0 ] && [ "$(jq -r .behind_by <<< "$compare")" != 0 ]; then
+                  reason="This PR changes workflow files and is behind $base_branch, and the queue can't build a test merge for those. Update the branch, then add the \`$LABEL\` label again."
+                else
+                  reason="The queue couldn't check this PR. Add the \`$LABEL\` label again to retry."
+                fi
               fi
               reject invalid "$reason"
               exit 0 ;;
@@ -305,6 +315,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Delete the temporary test branch prepare may have made for this run.
+          gh api -X DELETE "repos/$REPO/git/refs/heads/merge-queue/test-$PR-$GITHUB_RUN_ID" > /dev/null 2>&1 \
+            && echo "Deleted merge-queue/test-$PR-$GITHUB_RUN_ID." || true
           base_branch=$(gh api "repos/$REPO" --jq .default_branch)
           queue_workflow=${CALLER_WORKFLOW_REF%@*}
           queue_workflow=${queue_workflow##*/}
