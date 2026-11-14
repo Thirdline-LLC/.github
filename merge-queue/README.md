@@ -16,7 +16,7 @@ gh pr edit N --add-label merge-queue
 ```
 
 Take it out of the queue: remove the label. If the queue is already testing it, it stops before
-the merge.
+the merge and says so on the PR.
 
 The PR must be open, not a draft, based on `main`, and from a branch in the same repo. Its own
 checks may still be running when you queue it. The queue waits for them.
@@ -26,9 +26,12 @@ What the queue's comments mean:
 | Comment | Meaning |
 |---|---|
 | Queued: testing against main `abc1234`. | Tests run on the PR merged into that `main`. |
-| Already up to date with main and checks passed: merging. | Nothing to re-test. |
+| Already up to date with main and checks passed. It will merge if nothing changes. | Nothing to re-test. |
 | Merged as `abc1234`. | Done. The label is gone. Main's push workflows were started. |
 | Tests failed against main `abc1234`. | The PR breaks on the latest `main`. The label is gone. Fix it and queue it again. |
+| Testing was cancelled. | Someone cancelled the run. The label is gone. Queue it again. |
+| The queue hit an error with this PR. | Something broke in the queue itself. The label is gone. Queue it again. |
+| The label was removed, so the queue stopped. | Someone took it out of the queue mid-test. |
 | This PR conflicts with main. | Merge `main` into the branch, fix the conflict, queue it again. |
 | Main moved while testing. Testing again. | Something else reached `main` first. The label stays. Nothing to do. |
 | This PR changed while testing. Testing again. | Someone pushed to the PR. The label stays. Nothing to do. |
@@ -41,7 +44,9 @@ Each repo has two small workflows. The shared logic lives here, in
 `.github/workflows/merge-queue-prepare.yml` and `.github/workflows/merge-queue-finish.yml`.
 
 1. `merge-queue-kick.yml` runs when a PR gets the label. It starts `merge-queue.yml` on `main`.
-   It checks out nothing.
+   It checks out nothing. It also runs when a queue run ends without success, and starts the
+   queue again if PRs still have the label, no queue run is waiting or running, and the last 3
+   finished runs didn't all fail.
 2. `merge-queue.yml` runs one at a time (`concurrency: merge-queue`, never cancelled).
    - **prepare** picks the open PR that got the label first. It ignores which PR started the run.
    - It checks the PR against the current `main`:
@@ -55,7 +60,9 @@ Each repo has two small workflows. The shared logic lives here, in
      checks that neither `main` nor the PR moved, sets the commit status `merge-queue` to success
      on the PR head, and squash-merges with the head pinned. It then starts the `post_merge`
      workflows on `main`, because merges made with the workflow token don't fire `push`.
-   - Each run handles one PR. If more PRs have the label, finish starts the queue again.
+   - Each run handles one PR. If more PRs have the label, finish starts the queue again. If the
+     run hit an error instead, finish takes that PR out of the queue and leaves the restart to
+     `merge-queue-kick`.
 3. Branch protection requires the `merge-queue` status, so a PR can't merge without the queue.
    "Require branches to be up to date" stays off.
 
@@ -65,8 +72,8 @@ GitHub keeps a test merge for each PR (`refs/pull/N/merge`), but it doesn't refr
 merge made with the workflow token. So after the queue merges one PR, the others' test merges are
 stale. prepare uses GitHub's test merge only when its parents are exactly the latest `main` and
 the PR head. Otherwise it makes its own: it creates the branch `merge-queue/test-<pr>-<run>` at
-`main` and merges the PR head into it with the merges API. finish deletes that branch, and the
-next prepare deletes any that were left behind.
+`main` and merges the PR head into it with the merges API, then checks the new commit's
+parents. finish deletes that branch, and the next prepare deletes any that were left behind.
 
 ### prepare outputs
 
@@ -84,7 +91,8 @@ Inputs (both optional): `label` (default `merge-queue`) and `status_context` (de
 ### finish inputs
 
 `pr`, `head_sha`, `base_sha`, `state` and `test_result` (`success` or `failure`) from the
-caller. `post_merge`: space-separated workflow files to start on `main` after a merge. `label` and
+caller. Only `success` counts as passed: the template turns a failed, cancelled or skipped CI job
+into `failure`. `post_merge`: space-separated workflow files to start on `main` after a merge. `label` and
 `status_context` as above.
 
 ## Installing it in a repo
@@ -96,6 +104,9 @@ Do the file changes in a branch and a PR like any other change.
    - Leave `merge-queue-kick.yml` as it is.
    - In `merge-queue.yml`, add one job per CI workflow file that produces a required check,
      named after the file, and list each job in `finish.needs`.
+   - Each CI job keeps `permissions: contents: read` from the template, because it runs PR
+     code. It gets no secrets. If that CI needs a secret, pass it by name under `secrets:`.
+     Don't use `secrets: inherit`.
    - Set `post_merge` to the workflows that run on push to `main`.
 2. **Change each of those CI workflows**, and each one that runs on push to `main`:
    - Add a `workflow_call` trigger with a string input `ref` (default `''`), and
@@ -103,8 +114,8 @@ Do the file changes in a branch and a PR like any other change.
    - Give every `actions/checkout` step `ref: ${{ inputs.ref }}`. If it already sets `ref`,
      use `${{ inputs.ref || <old expression> }}`.
    - **Add a workflow-level `permissions:` block with the least it needs**, usually
-     `contents: read`. A called workflow otherwise gets the queue's write token, and the queue
-     runs PR code with it.
+     `contents: read`. With the caller job's `contents: read`, PR code tested by the queue never
+     gets a write token.
    - In a called run, `github.event_name` is `workflow_dispatch`, `github.event.pull_request` is
      empty, and `github.ref` and `github.sha` are main's. Steps gated on `pull_request` must also
      run when `inputs.ref != ''`. A diff against `github.event.pull_request.base.sha` needs a
@@ -112,7 +123,7 @@ Do the file changes in a branch and a PR like any other change.
    - A `concurrency` group built from `github.ref` or `github.workflow` must include
      `inputs.ref`, so a queue run never cancels main's runs.
    - Don't rename jobs. Required check names must still match on normal PR runs.
-   - The queue passes `secrets: inherit`.
+   - Note any secrets it uses. The queue passes none unless you name them in the caller.
 3. **Settings** (a repo admin does these):
    - Label: `gh label create merge-queue --color 0E8A16 --description "Queued to merge after testing against the latest main"`.
    - Branch protection on `main`: add `merge-queue` to the required checks, pinned to the GitHub
@@ -139,9 +150,11 @@ Actions app and a ruleset that requires PRs:
 
 ## Known limits
 
-- **Any workflow in the repo can set the status.** A workflow with `statuses: write` sets a
-  `merge-queue` status that counts, so pinning stops people, not workflows. Review workflow
-  changes with that in mind.
+- **The queue stops people, not workflows.** The `merge-queue` check is pinned to the GitHub
+  Actions app. A workflow with `statuses: write` on any branch, including a PR's own branch,
+  runs as that app and can set the status. Review workflow changes with that in mind. A
+  dedicated GitHub App token for the queue would close this, and its merges would also fire
+  `push` workflows.
 - **CI definitions come from `main`.** The queue runs the CI workflow files on `main`, not the
   PR's copy. A PR that changes CI is tested with the old CI.
 - **Last-second pushes.** A push to the PR in the second or two before the merge can be left
@@ -153,9 +166,12 @@ Actions app and a ruleset that requires PRs:
 - **One PR at a time.** A repo with long CI and many PRs waits in line. There is no batching.
 - **The queue waits up to 30 minutes** for a PR's own required checks. Longer than that, it
   takes the PR out of the queue.
-- **Forks aren't supported.** The queue runs PR code with the repo's secrets.
-- **Errors before a PR is picked** (for example a GitHub outage) fail the run and stop the
-  queue. Re-run the failed run or add the label again.
+- **Forks aren't supported.** The queue runs PR code in the base repo.
+- **Restarts are limited.** `merge-queue-kick` restarts the queue after a bad run, but stops
+  after 3 failed runs in a row. Then fix the cause and run `merge-queue.yml` by hand. If the
+  label can't be removed from a PR, the run fails loudly and the PR needs a person.
+- **Billing.** Each queue run, and each restart check, is a few short jobs. Private repos pay at
+  least a minute per job. There is no schedule, so an idle queue costs nothing.
 - **Test branches.** Apps that build every branch (preview deploys) will also see the
   `merge-queue/test-*` branches.
 

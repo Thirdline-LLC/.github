@@ -84,7 +84,7 @@ jobs:
             {
               gh api "repos/$REPO/branches/$(uri "$base_branch")" \
                 --jq '.protection.required_status_checks.contexts[]?' 2>/dev/null || true
-              gh api "repos/$REPO/rules/branches/$(uri "$base_branch")" \
+              gh api --paginate "repos/$REPO/rules/branches/$(uri "$base_branch")" \
                 --jq '.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context' 2>/dev/null || true
             } | grep -vxF -- "$STATUS_CONTEXT" | sort -u || true
           }
@@ -92,15 +92,16 @@ jobs:
           # success, pending or failure for one check name on one commit.
           context_state() {
             local sha=$1 ctx=$2 run st
-            run=$(gh api "repos/$REPO/commits/$sha/check-runs?check_name=$(uri "$ctx")&filter=latest&per_page=100" \
-              --jq '.check_runs | sort_by(.id) | last | if . == null then "" else "\(.status):\(.conclusion // "")" end')
+            run=$(gh api --paginate "repos/$REPO/commits/$sha/check-runs?check_name=$(uri "$ctx")&filter=latest&per_page=100" \
+                --jq '.check_runs[]' \
+              | jq -rs 'sort_by(.id) | last | if . == null then "" else "\(.status):\(.conclusion // "")" end')
             case "$run" in
               completed:success|completed:neutral|completed:skipped) echo success; return ;;
               completed:*) echo failure; return ;;
               ?*) echo pending; return ;;
             esac
-            st=$(gh api "repos/$REPO/commits/$sha/status" | jq -r --arg c "$ctx" \
-              '[.statuses[] | select(.context == $c)] | first | .state // ""')
+            st=$(gh api --paginate "repos/$REPO/commits/$sha/status?per_page=100" --jq '.statuses[]' \
+              | jq -rs --arg c "$ctx" 'map(select(.context == $c)) | first | .state // ""')
             case "$st" in
               success) echo success ;;
               failure|error) echo failure ;;
@@ -136,7 +137,8 @@ jobs:
           name=${REPO#*/}
 
           # Runs are one at a time, so any temporary test branch left now is from an old run.
-          for ref in $(gh api "repos/$REPO/git/matching-refs/heads/merge-queue/test-" --jq '.[].ref'); do
+          for ref in $(gh api --paginate "repos/$REPO/git/matching-refs/heads/merge-queue/test-" --jq '.[].ref'); do
+            [[ "$ref" =~ ^refs/heads/merge-queue/test-[0-9]+-[0-9]+$ ]] || continue
             gh api -X DELETE "repos/$REPO/git/$ref" > /dev/null && echo "Deleted old ${ref#refs/heads/}."
           done
 
@@ -230,7 +232,7 @@ jobs:
               if [ "$checks_state" = success ]; then
                 result state ready
                 comment_once "prepare:$head_sha:$base_sha" \
-                  "Already up to date with $base_branch and checks passed: merging."
+                  "Already up to date with $base_branch and checks passed. It will merge if nothing changes."
               else
                 echo "PR #$pr checks are $checks_state ${failed_checks:+($failed_checks)}."
                 result state invalid
@@ -273,16 +275,18 @@ jobs:
             if merge_json=$(gh api -X POST "repos/$REPO/merges" -f base="$branch" -f head="$head_sha" \
                   -f commit_message="Merge queue test: #$pr into $base_branch ${base_sha:0:7}" 2> "$err_file"); then
               test_ref=$(jq -r '.sha // empty' <<< "$merge_json")
+              parents=$(jq -r '[.parents[].sha] | join(" ")' <<< "$merge_json")
+              if [ -z "$test_ref" ] || [ "$parents" != "$base_sha $head_sha" ]; then
+                echo "::warning::The test merge for PR #$pr has parents '$parents', not [$base_sha, $head_sha]."
+                result state invalid
+                exit 0
+              fi
               echo "Built test merge $test_ref on $branch."
             else
               err=$(cat "$err_file")
               echo "Couldn't build a test merge: $err"
               if grep -q 'HTTP 409' <<< "$err"; then
                 echo "PR #$pr doesn't merge cleanly into $base_branch."
-                result state conflict
-                exit 0
-              fi
-              if [ "$mergeable" = false ]; then
                 result state conflict
               else
                 echo "::warning::The queue couldn't build a test merge for PR #$pr: $err"
