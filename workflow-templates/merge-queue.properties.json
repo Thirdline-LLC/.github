@@ -1,0 +1,7 @@
+{
+  "name": "Merge queue",
+  "description": "Merges PRs labelled merge-queue one at a time, after testing each against the latest main. Add merge-queue-kick too.",
+  "iconName": "octicon git-merge-queue",
+  "categories": ["Automation"],
+  "labels": ["merge-queue"]
+}

@@ -1,0 +1,297 @@
+name: merge-queue-prepare
+# Shared merge queue, step 1 of 2. Picks the oldest queued PR and decides what to do with it.
+# Called from each repo's merge-queue.yml. How it works: merge-queue/README.md in this repo.
+
+on:
+  workflow_call:
+    inputs:
+      label:
+        description: Label that queues a PR.
+        type: string
+        required: false
+        default: merge-queue
+      status_context:
+        description: Commit status the queue sets right before it merges.
+        type: string
+        required: false
+        default: merge-queue
+    outputs:
+      pr:
+        description: PR number being processed, or empty when nothing is queued.
+        value: ${{ jobs.prepare.outputs.pr }}
+      head_sha:
+        description: PR head SHA when picked.
+        value: ${{ jobs.prepare.outputs.head_sha }}
+      base_sha:
+        description: Default-branch SHA the test merge was built on.
+        value: ${{ jobs.prepare.outputs.base_sha }}
+      test_ref:
+        description: SHA of GitHub's test merge commit (latest base + PR head).
+        value: ${{ jobs.prepare.outputs.test_ref }}
+      state:
+        description: none, ready, test, conflict or invalid.
+        value: ${{ jobs.prepare.outputs.state }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read        # default branch, compare, commits
+      pull-requests: write  # read the queue, comment on the PR
+      statuses: read        # PR head commit statuses
+      checks: read          # PR head check runs
+    outputs:
+      pr: ${{ steps.out.outputs.pr }}
+      head_sha: ${{ steps.out.outputs.head_sha }}
+      base_sha: ${{ steps.out.outputs.base_sha }}
+      test_ref: ${{ steps.out.outputs.test_ref }}
+      state: ${{ steps.out.outputs.state }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      LABEL: ${{ inputs.label }}
+      STATUS_CONTEXT: ${{ inputs.status_context }}
+      # How long to wait for the PR's own required checks when it is already up to date.
+      CHECKS_WAIT_SECONDS: '1800'
+    steps:
+      - name: Pick the oldest queued PR and check it
+        id: pick
+        shell: bash
+        run: |
+          set -euo pipefail
+          RESULT_FILE="$RUNNER_TEMP/merge-queue-prepare.out"
+          : > "$RESULT_FILE"
+          result() { echo "$1=$2" >> "$RESULT_FILE"; }
+          uri() { jq -rn --arg s "$1" '$s|@uri'; }
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+          # Post a comment once. The hidden marker makes re-runs skip it.
+          comment_once() {
+            local key=$1 body=$2 marker existing
+            marker="<!-- merge-queue:$key -->"
+            existing=$(gh api --paginate "repos/$REPO/issues/$pr/comments" --jq '.[].body')
+            if grep -qF -- "$marker" <<< "$existing"; then
+              echo "Comment '$key' already posted."
+              return 0
+            fi
+            gh api "repos/$REPO/issues/$pr/comments" -f body="$body
+          $marker" > /dev/null
+          }
+
+          # Required checks on the default branch (classic protection + rulesets), minus our own.
+          required_contexts() {
+            {
+              gh api "repos/$REPO/branches/$(uri "$base_branch")" \
+                --jq '.protection.required_status_checks.contexts[]?' 2>/dev/null || true
+              gh api "repos/$REPO/rules/branches/$(uri "$base_branch")" \
+                --jq '.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context' 2>/dev/null || true
+            } | grep -vxF -- "$STATUS_CONTEXT" | sort -u || true
+          }
+
+          # success, pending or failure for one check name on one commit.
+          context_state() {
+            local sha=$1 ctx=$2 run st
+            run=$(gh api "repos/$REPO/commits/$sha/check-runs?check_name=$(uri "$ctx")&filter=latest&per_page=100" \
+              --jq '.check_runs | sort_by(.id) | last | if . == null then "" else "\(.status):\(.conclusion // "")" end')
+            case "$run" in
+              completed:success|completed:neutral|completed:skipped) echo success; return ;;
+              completed:*) echo failure; return ;;
+              ?*) echo pending; return ;;
+            esac
+            st=$(gh api "repos/$REPO/commits/$sha/status" | jq -r --arg c "$ctx" \
+              '[.statuses[] | select(.context == $c)] | first | .state // ""')
+            case "$st" in
+              success) echo success ;;
+              failure|error) echo failure ;;
+              *) echo pending ;;
+            esac
+          }
+
+          # Sets checks_state (success, pending, failure, unknown) and failed_checks for a commit.
+          check_required() {
+            local sha=$1 ctx s
+            local -a ctxs
+            checks_state=success
+            failed_checks=""
+            if [ -z "$required" ]; then
+              checks_state=unknown
+              return
+            fi
+            mapfile -t ctxs <<< "$required"
+            for ctx in "${ctxs[@]}"; do
+              s=$(context_state "$sha" "$ctx")
+              echo "  $ctx: $s"
+              if [ "$s" = failure ]; then
+                checks_state=failure
+                failed_checks="${failed_checks:+$failed_checks, }$ctx"
+              elif [ "$s" = pending ] && [ "$checks_state" != failure ]; then
+                checks_state=pending
+              fi
+            done
+          }
+
+          base_branch=$(gh api "repos/$REPO" --jq .default_branch)
+          owner=${REPO%%/*}
+          name=${REPO#*/}
+
+          # 1. The oldest queued PR: FIFO by the latest time the label was added.
+          queue=$(gh api graphql \
+            -f owner="$owner" -f name="$name" -f label="$LABEL" \
+            -f query='
+              query($owner: String!, $name: String!, $label: String!) {
+                repository(owner: $owner, name: $name) {
+                  pullRequests(states: OPEN, labels: [$label], first: 100) {
+                    nodes {
+                      number
+                      timelineItems(itemTypes: [LABELED_EVENT], last: 100) {
+                        nodes { ... on LabeledEvent { createdAt label { name } } }
+                      }
+                    }
+                  }
+                }
+              }' \
+            | jq -c --arg label "$LABEL" '
+                [.data.repository.pullRequests.nodes[]
+                  | { number,
+                      queued_at: ([.timelineItems.nodes[] | select(.label.name == $label) | .createdAt]
+                                  | max // "9999-12-31T00:00:00Z") }]
+                | sort_by(.queued_at, .number)')
+          echo "Queue (oldest first): $queue"
+          pr=$(jq -r '.[0].number // empty' <<< "$queue")
+          if [ -z "$pr" ]; then
+            echo "Nothing is queued."
+            result state none
+            exit 0
+          fi
+          result pr "$pr"
+          echo "Picked PR #$pr."
+
+          # 2. Basic checks: open, not a draft, based on the default branch, not from a fork.
+          pull=$(gh api "repos/$REPO/pulls/$pr")
+          head_sha=$(jq -r .head.sha <<< "$pull")
+          result head_sha "$head_sha"
+          pr_state=$(jq -r .state <<< "$pull")
+          draft=$(jq -r .draft <<< "$pull")
+          pr_base=$(jq -r .base.ref <<< "$pull")
+          head_repo=$(jq -r '.head.repo.full_name // ""' <<< "$pull")
+          if [ "$pr_state" != open ] || [ "$draft" = true ] || [ "$pr_base" != "$base_branch" ] \
+             || [ "$head_repo" != "$REPO" ]; then
+            echo "PR #$pr can't be queued: state=$pr_state draft=$draft base=$pr_base head_repo=$head_repo."
+            result state invalid
+            exit 0
+          fi
+
+          # 3. Wait for GitHub's test merge commit: mergeable known, parents = [latest base, PR head].
+          state=""
+          for attempt in $(seq 1 24); do
+            base_sha=$(gh api "repos/$REPO/git/ref/heads/$(uri "$base_branch")" --jq .object.sha)
+            pull=$(gh api "repos/$REPO/pulls/$pr")
+            head_sha=$(jq -r .head.sha <<< "$pull")
+            mergeable=$(jq -r '.mergeable | if . == null then "null" else tostring end' <<< "$pull")
+            merge_sha=$(jq -r '.merge_commit_sha // ""' <<< "$pull")
+            echo "Attempt $attempt: base=$base_sha head=$head_sha mergeable=$mergeable merge=$merge_sha"
+            if [ "$mergeable" = false ]; then
+              state=conflict
+              break
+            fi
+            if [ "$mergeable" = true ] && [ -n "$merge_sha" ]; then
+              parents=$(gh api "repos/$REPO/git/commits/$merge_sha" --jq '[.parents[].sha] | join(" ")')
+              if [ "$parents" = "$base_sha $head_sha" ]; then
+                state="test"
+                break
+              fi
+              echo "  Test merge parents are '$parents', not yet [base, head]."
+            fi
+            sleep 5
+          done
+          result head_sha "$head_sha"
+          result base_sha "${base_sha:-}"
+          if [ "$state" = conflict ]; then
+            echo "PR #$pr doesn't merge cleanly into $base_branch."
+            result state conflict
+            exit 0
+          fi
+          if [ "$state" != test ]; then
+            echo "::warning::GitHub didn't prepare the test merge for PR #$pr in time."
+            result state invalid
+            exit 0
+          fi
+          result test_ref "$merge_sha"
+
+          # 4. The PR's own required checks. GitHub needs them green on the head to merge.
+          required=$(required_contexts)
+          echo "Required checks besides '$STATUS_CONTEXT': ${required//$'\n'/, }"
+          behind_by=$(gh api "repos/$REPO/compare/$base_sha...$head_sha" --jq .behind_by)
+          echo "PR head is $behind_by commit(s) behind $base_branch."
+
+          if [ "$behind_by" = 0 ] && [ -n "$required" ]; then
+            # Up to date: its own checks already tested exactly what would merge. Wait for them.
+            waited=0
+            while :; do
+              check_required "$head_sha"
+              [ "$checks_state" != pending ] && break
+              if [ "$waited" -ge "$CHECKS_WAIT_SECONDS" ]; then
+                echo "Checks still pending after ${waited}s."
+                break
+              fi
+              sleep 20
+              waited=$((waited + 20))
+            done
+            case "$checks_state" in
+              success)
+                result state ready
+                comment_once "prepare:$head_sha:$base_sha" \
+                  "Already up to date with $base_branch and checks passed: merging."
+                exit 0 ;;
+              failure|pending)
+                echo "PR #$pr checks are $checks_state ($failed_checks)."
+                result state invalid
+                exit 0 ;;
+            esac
+          fi
+
+          # Behind (or required checks unknown): test the merge commit.
+          check_required "$head_sha"
+          if [ "$checks_state" = failure ]; then
+            echo "PR #$pr has failing required checks: $failed_checks."
+            result state invalid
+            exit 0
+          fi
+          result state test
+          comment_once "prepare:$head_sha:$base_sha" \
+            "Queued: testing against $base_branch \`${base_sha:0:7}\`. [Run]($run_url)"
+
+      - name: Publish outputs
+        id: out
+        if: always()
+        shell: bash
+        env:
+          PICK_OUTCOME: ${{ steps.pick.outcome }}
+        run: |
+          set -euo pipefail
+          RESULT_FILE="$RUNNER_TEMP/merge-queue-prepare.out"
+          get() { grep -E "^$1=" "$RESULT_FILE" 2>/dev/null | tail -n 1 | cut -d= -f2- || true; }
+          pr=$(get pr)
+          state=$(get state)
+          if [ -z "$pr" ]; then
+            state=none
+          elif [ "$PICK_OUTCOME" != success ]; then
+            echo "::error::The queue hit an error while checking PR #$pr. It will be taken out of the queue."
+            state=invalid
+          fi
+          {
+            echo "pr=$pr"
+            echo "head_sha=$(get head_sha)"
+            echo "base_sha=$(get base_sha)"
+            echo "test_ref=$(get test_ref)"
+            echo "state=${state:-invalid}"
+          } | tee -a "$GITHUB_OUTPUT"
+          {
+            echo "### Merge queue"
+            if [ -n "$pr" ]; then
+              echo "PR #$pr: **${state:-invalid}**"
+            else
+              echo "Nothing is queued."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

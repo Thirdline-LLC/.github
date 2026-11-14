@@ -1,0 +1,17 @@
+name: merge-queue-kick
+# Adding the "merge-queue" label starts the queue. Runs main's copy of this file and checks out
+# nothing from the PR.
+on:
+  pull_request_target:
+    types: [labeled]
+permissions:
+  actions: write
+jobs:
+  kick:
+    if: github.event.label.name == 'merge-queue'
+    runs-on: ubuntu-latest
+    steps:
+      - run: gh workflow run merge-queue.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}

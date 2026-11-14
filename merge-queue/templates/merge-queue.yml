@@ -1,0 +1,39 @@
+name: merge-queue
+# Merges queued PRs one at a time after testing each against the latest main.
+# Queue a PR: gh pr edit N --add-label merge-queue
+# How it works: https://github.com/Thirdline-LLC/.github/blob/main/merge-queue/README.md
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+  statuses: write
+  actions: write
+  checks: read
+concurrency:
+  group: merge-queue
+  cancel-in-progress: false
+jobs:
+  prepare:
+    uses: Thirdline-LLC/.github/.github/workflows/merge-queue-prepare.yml@v1
+
+  # This repo's required checks, run on the PR merged into the latest main.
+  checks:                      # one job per CI workflow file; name it after the file
+    needs: prepare
+    if: needs.prepare.outputs.state == 'test'
+    uses: ./.github/workflows/checks.yml
+    with:
+      ref: ${{ needs.prepare.outputs.test_ref }}
+    secrets: inherit
+
+  finish:
+    needs: [prepare, checks]   # prepare plus every CI job
+    if: always() && needs.prepare.outputs.pr != ''
+    uses: Thirdline-LLC/.github/.github/workflows/merge-queue-finish.yml@v1
+    with:
+      pr: ${{ needs.prepare.outputs.pr }}
+      head_sha: ${{ needs.prepare.outputs.head_sha }}
+      base_sha: ${{ needs.prepare.outputs.base_sha }}
+      state: ${{ needs.prepare.outputs.state }}
+      test_result: ${{ (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) && 'failure' || 'success' }}
+      post_merge: checks.yml   # space-separated; workflows that run on push to main
