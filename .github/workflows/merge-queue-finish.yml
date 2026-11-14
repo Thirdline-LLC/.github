@@ -296,16 +296,26 @@ jobs:
           message=$(jq -r '.message // empty' <<< "${out:-}" 2>/dev/null || true)
           [ -n "$message" ] || message=$(cat "$err_file")
           echo "GitHub refused the merge: $message"
-          touches_workflows=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[].filename' \
-            | grep -c '^\.github/workflows/' || true)
-          if grep -qi 'workflow' <<< "$message" || [ "${touches_workflows:-0}" -gt 0 ]; then
-            # The workflow token can't merge workflow changes. Keep the success status for a person.
-            remove_label
-            comment_once "workflows:$HEAD_SHA:$BASE_SHA" "Tests passed against $base_branch. GitHub doesn't let the queue merge workflow changes: merge it with \`gh pr merge $PR --squash\`."
+          # Something moved between the re-check and the merge: leave the label and test again.
+          if grep -qi 'head branch was modified' <<< "$message"; then
+            set_status pending "Testing again."
+            comment_once "moved-head:$HEAD_SHA:$BASE_SHA" "This PR changed while testing. Testing again."
             exit 0
           fi
-          if grep -qiE 'base branch was modified|head branch was modified' <<< "$message"; then
+          if grep -qi 'base branch was modified' <<< "$message"; then
+            set_status pending "Testing again against the latest $base_branch."
             comment_once "moved-base:$HEAD_SHA:$BASE_SHA" "$base_name moved while testing. Testing again."
+            exit 0
+          fi
+          # A token without the workflows permission can be refused workflow changes. (In testing,
+          # GitHub let the workflow token merge them, so this is a fallback.) Keep the success
+          # status so a person can merge this exact head.
+          touches_workflows=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[].filename' \
+            | grep -c '^\.github/workflows/' || true)
+          if grep -qi 'workflow' <<< "$message" \
+             || { [ "${touches_workflows:-0}" -gt 0 ] && grep -qi 'not accessible by integration' <<< "$message"; }; then
+            remove_label
+            comment_once "workflows:$HEAD_SHA:$BASE_SHA" "Tests passed against $base_branch. GitHub doesn't let the queue merge workflow changes: merge it with \`gh pr merge $PR --squash\`."
             exit 0
           fi
           reject refused "Tests passed, but GitHub refused the merge: $message"
