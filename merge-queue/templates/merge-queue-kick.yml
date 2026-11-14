@@ -1,48 +1,17 @@
 name: merge-queue-kick
-# Adding the "merge-queue" label starts the queue. If a queue run ends badly while PRs still
-# wait, this starts it again. Runs main's copy of this file and checks out nothing from the PR.
+# Adding the "merge-queue" label starts the queue. Runs main's copy of this file and checks out
+# nothing from the PR.
 on:
   pull_request_target:
     types: [labeled]
-  workflow_run:
-    workflows: [merge-queue]
-    types: [completed]
 permissions:
   actions: write
-  pull-requests: read
 jobs:
   kick:
-    if: github.event_name == 'pull_request_target' && github.event.label.name == 'merge-queue'
+    if: github.event.label.name == 'merge-queue'
     runs-on: ubuntu-latest
     steps:
       - run: gh workflow run merge-queue.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"
         env:
           GH_TOKEN: ${{ github.token }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-
-  restart:
-    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion != 'success'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Start the queue again if PRs still wait
-        env:
-          GH_TOKEN: ${{ github.token }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          set -euo pipefail
-          waiting=$(gh pr list --repo "$GITHUB_REPOSITORY" --label merge-queue --state open --json number --jq length)
-          active=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow merge-queue.yml --limit 20 \
-            --json status --jq '[.[] | select(.status != "completed")] | length')
-          # Loop guard: the last 3 finished runs, not counting cancelled ones.
-          recent=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow merge-queue.yml --status completed --limit 20 \
-            --json conclusion --jq '[.[] | select(.conclusion == "success" or .conclusion == "failure") | .conclusion][:3] | join(" ")')
-          echo "Waiting PRs: $waiting. Active queue runs: $active. Last 3 finished runs: $recent."
-          if [ "$waiting" -eq 0 ] || [ "$active" -gt 0 ]; then
-            echo "Nothing to restart."
-          elif [ "$recent" = "failure failure failure" ]; then
-            echo "::error::The last 3 queue runs failed. Not restarting. Fix the cause, then run merge-queue.yml by hand."
-            exit 1
-          else
-            gh workflow run merge-queue.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"
-            echo "Started merge-queue.yml again."
-          fi

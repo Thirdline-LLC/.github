@@ -44,9 +44,7 @@ Each repo has two small workflows. The shared logic lives here, in
 `.github/workflows/merge-queue-prepare.yml` and `.github/workflows/merge-queue-finish.yml`.
 
 1. `merge-queue-kick.yml` runs when a PR gets the label. It starts `merge-queue.yml` on `main`.
-   It checks out nothing. It also runs when a queue run ends without success, and starts the
-   queue again if PRs still have the label, no queue run is waiting or running, and the last 3
-   finished runs didn't all fail.
+   It checks out nothing.
 2. `merge-queue.yml` runs one at a time (`concurrency: merge-queue`, never cancelled).
    - **prepare** picks the open PR that got the label first. It ignores which PR started the run.
    - It checks the PR against the current `main`:
@@ -60,9 +58,13 @@ Each repo has two small workflows. The shared logic lives here, in
      checks that neither `main` nor the PR moved, sets the commit status `merge-queue` to success
      on the PR head, and squash-merges with the head pinned. It then starts the `post_merge`
      workflows on `main`, because merges made with the workflow token don't fire `push`.
-   - Each run handles one PR. If more PRs have the label, finish starts the queue again. If the
-     run hit an error instead, finish takes that PR out of the queue and leaves the restart to
-     `merge-queue-kick`.
+   - Each run handles one PR. If more PRs have the label, finish starts the queue again.
+   - If a run hits an error, finish takes that PR out of the queue with a comment, then starts
+     the queue again for the others. It doesn't restart after the third failed run in a row.
+     If the run fails before it picks a PR, prepare restarts it, with the same limit.
+     A cancelled run doesn't restart: run `merge-queue.yml` by hand.
+   - A watcher on `workflow_run` can't do this job. GitHub doesn't fire `workflow_run` for runs
+     started with the workflow token, and every queue run is.
 3. Branch protection requires the `merge-queue` status, so a PR can't merge without the queue.
    "Require branches to be up to date" stays off.
 
@@ -167,11 +169,12 @@ Actions app and a ruleset that requires PRs:
 - **The queue waits up to 30 minutes** for a PR's own required checks. Longer than that, it
   takes the PR out of the queue.
 - **Forks aren't supported.** The queue runs PR code in the base repo.
-- **Restarts are limited.** `merge-queue-kick` restarts the queue after a bad run, but stops
-  after 3 failed runs in a row. Then fix the cause and run `merge-queue.yml` by hand. If the
-  label can't be removed from a PR, the run fails loudly and the PR needs a person.
-- **Billing.** Each queue run, and each restart check, is a few short jobs. Private repos pay at
-  least a minute per job. There is no schedule, so an idle queue costs nothing.
+- **Restarts are limited.** After an error the queue restarts itself, but not after 3 failed runs
+  in a row. A cancelled run, or a run whose PR keeps its label, doesn't restart. Then fix the
+  cause and run `merge-queue.yml` by hand. If the label can't be removed, the run fails loudly
+  and the PR needs a person.
+- **Billing.** Each queue run is a few short jobs, and private repos pay at least a minute per
+  job. There is no schedule, so an idle queue costs nothing.
 - **Test branches.** Apps that build every branch (preview deploys) will also see the
   `merge-queue/test-*` branches.
 

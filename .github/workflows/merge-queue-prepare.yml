@@ -41,6 +41,7 @@ jobs:
       pull-requests: write  # read the queue, comment on the PR
       statuses: read        # PR head commit statuses
       checks: read          # PR head check runs
+      actions: write        # start the queue again after an error before a PR was picked
     outputs:
       pr: ${{ steps.out.outputs.pr }}
       head_sha: ${{ steps.out.outputs.head_sha }}
@@ -338,3 +339,25 @@ jobs:
               echo "Nothing is queued."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Start the queue again after an error
+        # The run failed before it picked a PR, so finish won't run. Try once more, unless the 2
+        # finished runs before this one failed too.
+        if: failure() && steps.out.outputs.pr == ''
+        shell: bash
+        env:
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          queue_workflow=${CALLER_WORKFLOW_REF%@*}
+          queue_workflow=${queue_workflow##*/}
+          [ -n "$queue_workflow" ] || queue_workflow=merge-queue.yml
+          recent=$(gh run list -R "$REPO" --workflow "$queue_workflow" --status completed --limit 20 \
+            --json conclusion --jq '[.[] | select(.conclusion == "success" or .conclusion == "failure") | .conclusion][:2] | join(" ")')
+          echo "Previous finished queue runs: $recent."
+          if [ "$recent" = "failure failure" ]; then
+            echo "::error::This is the third failed queue run in a row, so it doesn't start the queue again. Fix the cause, then run $queue_workflow by hand."
+            exit 0
+          fi
+          gh workflow run "$queue_workflow" -R "$REPO" --ref "$(gh api "repos/$REPO" --jq .default_branch)"
+          echo "Started $queue_workflow again."

@@ -369,6 +369,7 @@ jobs:
           reject refused "Tests passed, but GitHub refused the merge: $message"
 
       - name: Take the PR out of the queue after an error
+        id: cleanup
         if: failure() && steps.act.outcome == 'failure'
         shell: bash
         run: |
@@ -402,20 +403,34 @@ jobs:
         shell: bash
         env:
           ACT_OUTCOME: ${{ steps.act.outcome }}
+          CLEANUP_OUTCOME: ${{ steps.cleanup.outcome }}
         run: |
           set -euo pipefail
           # Delete the temporary test branch prepare may have made for this run.
           gh api -X DELETE "repos/$REPO/git/refs/heads/merge-queue/test-$PR-$GITHUB_RUN_ID" > /dev/null 2>&1 \
             && echo "Deleted merge-queue/test-$PR-$GITHUB_RUN_ID." || true
-          if [ "$ACT_OUTCOME" != success ]; then
-            echo "This run didn't finish cleanly ($ACT_OUTCOME), so it doesn't start the queue again."
-            echo "merge-queue-kick restarts the queue if PRs still wait."
-            exit 0
-          fi
           base_branch=$(gh api "repos/$REPO" --jq .default_branch)
           queue_workflow=${CALLER_WORKFLOW_REF%@*}
           queue_workflow=${queue_workflow##*/}
           [ -n "$queue_workflow" ] || queue_workflow=merge-queue.yml
+
+          # Start the next run only when this PR's fate is settled: finish ran cleanly, or it hit
+          # an error and the cleanup step took the PR out of the queue.
+          if [ "$ACT_OUTCOME" != success ]; then
+            if [ "$CLEANUP_OUTCOME" != success ]; then
+              echo "::error::This run stopped before PR #$PR left the queue, so it doesn't start the queue again."
+              exit 0
+            fi
+            # Loop guard: this run failed. Don't restart if the 2 finished runs before it failed too.
+            recent=$(gh run list -R "$REPO" --workflow "$queue_workflow" --status completed --limit 20 \
+              --json conclusion --jq '[.[] | select(.conclusion == "success" or .conclusion == "failure") | .conclusion][:2] | join(" ")')
+            echo "Previous finished queue runs: $recent."
+            if [ "$recent" = "failure failure" ]; then
+              echo "::error::This is the third failed queue run in a row, so it doesn't start the queue again. Fix the cause, then run $queue_workflow by hand."
+              exit 0
+            fi
+          fi
+
           waiting=$(gh api graphql \
             -f owner="${REPO%%/*}" -f name="${REPO#*/}" -f label="$LABEL" \
             -f query='

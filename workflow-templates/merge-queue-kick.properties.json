@@ -1,11 +1,7 @@
 {
   "name": "Merge queue kick",
-  "description": "Starts the merge queue when a PR gets the merge-queue label, and restarts it after a run that ended badly. Use with the Merge queue workflow.",
+  "description": "Starts the merge queue when a PR gets the merge-queue label. Use with the Merge queue workflow.",
   "iconName": "octicon git-merge-queue",
-  "categories": [
-    "Automation"
-  ],
-  "labels": [
-    "merge-queue"
-  ]
+  "categories": ["Automation"],
+  "labels": ["merge-queue"]
 }
