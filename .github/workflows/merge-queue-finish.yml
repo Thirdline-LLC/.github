@@ -120,22 +120,26 @@ jobs:
           }
           trap on_exit EXIT
 
+          # 0: the PR has the label. 1: it doesn't. 2: GitHub didn't answer.
           has_label() {
             local labels
-            labels=$(gh api "repos/$REPO/pulls/$PR" --jq '.labels[].name')
+            labels=$(gh api "repos/$REPO/pulls/$PR" --jq '.labels[].name') || return 2
             grep -qxF -- "$LABEL" <<< "$labels"
           }
 
-          # Remove the label and check it's gone. If it stays, fail: the queue would pick it again.
+          # Remove the label and check it's gone. If it stays, or the check fails, fail: the queue
+          # would pick it again.
           remove_label() {
-            local attempt
+            local attempt rc
             for attempt in 1 2; do
               gh api -X DELETE "repos/$REPO/issues/$PR/labels/$(uri "$LABEL")" > /dev/null 2>&1 || true
-              if ! has_label; then
+              rc=0
+              has_label || rc=$?
+              if [ "$rc" = 1 ]; then
                 echo "Label '$LABEL' removed from #$PR."
                 return 0
               fi
-              echo "Label '$LABEL' is still on #$PR (attempt $attempt)."
+              echo "Label '$LABEL' may still be on #$PR (attempt $attempt)."
               sleep 3
             done
             echo "::error::Couldn't remove the '$LABEL' label from #$PR."
@@ -253,8 +257,9 @@ jobs:
             ready|test) ;;
 
             *)
-              echo "::warning::Unknown state '$STATE'. Nothing to do."
-              exit 0 ;;
+              # Fail, so the cleanup step takes the PR out of the queue and the loop guard applies.
+              echo "::error::Unknown state '$STATE' for PR #$PR."
+              exit 1 ;;
           esac
 
           if [ "$STATE" = test ] && [ "$TEST_RESULT" != success ]; then
@@ -325,8 +330,11 @@ jobs:
             outcome=merged
             merged_sha=$(jq -r .sha <<< "$out")
             echo "Merged #$PR as $merged_sha."
-            remove_label
-            comment_once "merged" "Merged as \`${merged_sha:0:7}\`."
+            # A label left on a merged PR is harmless (the queue only reads open PRs), so carry on
+            # and start the post-merge workflows anyway.
+            remove_label || echo "::warning::#$PR merged, but its '$LABEL' label is still on it."
+            comment_once "merged" "Merged as \`${merged_sha:0:7}\`." \
+              || echo "::warning::Couldn't comment on #$PR."
             # Merges made with the workflow token don't fire push workflows, so start them here.
             for wf in $POST_MERGE; do
               if gh workflow run "$wf" -R "$REPO" --ref "$base_branch"; then

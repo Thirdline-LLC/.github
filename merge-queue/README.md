@@ -62,7 +62,8 @@ Each repo has two small workflows. The shared logic lives here, in
    - If a run hits an error, finish takes that PR out of the queue with a comment, then starts
      the queue again for the others. It doesn't restart after the third failed run in a row.
      If the run fails before it picks a PR, prepare restarts it, with the same limit.
-     A cancelled run doesn't restart: run `merge-queue.yml` by hand.
+     A run cancelled before its PR leaves the queue doesn't restart: run `merge-queue.yml` by
+     hand.
    - A watcher on `workflow_run` can't do this job. GitHub doesn't fire `workflow_run` for runs
      started with the workflow token, and every queue run is.
 3. Branch protection requires the `merge-queue` status, so a PR can't merge without the queue.
@@ -170,9 +171,10 @@ Actions app and a ruleset that requires PRs:
   takes the PR out of the queue.
 - **Forks aren't supported.** The queue runs PR code in the base repo.
 - **Restarts are limited.** After an error the queue restarts itself, but not after 3 failed runs
-  in a row. A cancelled run, or a run whose PR keeps its label, doesn't restart. Then fix the
-  cause and run `merge-queue.yml` by hand. If the label can't be removed, the run fails loudly
-  and the PR needs a person.
+  in a row. A run whose tests failed also counts as a failed run here. A run cancelled before its
+  PR leaves the queue, or a run whose PR keeps its label, doesn't restart. Then fix the cause and
+  run `merge-queue.yml` by hand. If the label can't be removed, the run fails loudly and the PR
+  needs a person.
 - **Billing.** Each queue run is a few short jobs, and private repos pay at least a minute per
   job. There is no schedule, so an idle queue costs nothing.
 - **Test branches.** Apps that build every branch (preview deploys) will also see the
