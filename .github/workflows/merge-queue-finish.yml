@@ -208,11 +208,6 @@ jobs:
           merged=$(jq -r .merged <<< "$pull")
           cur_head=$(jq -r .head.sha <<< "$pull")
           echo "PR #$PR: state=$pr_state merged=$merged head=$cur_head queue state=$STATE test_result=$TEST_RESULT"
-          # TEMPORARY sandbox-only fault injection, to test the kick restart. Removed after testing.
-          if [ "$REPO" = Thirdline-LLC/merge-queue-sandbox ] && [[ "$(jq -r .title <<< "$pull")" == *"[mq-test: fail finish]"* ]]; then
-            echo "::error::Sandbox fault injection."
-            exit 1
-          fi
 
           # Closed or merged some other way: just take it out of the queue.
           if [ "$pr_state" != open ]; then
