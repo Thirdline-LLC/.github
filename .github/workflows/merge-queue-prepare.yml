@@ -34,6 +34,8 @@ on:
 
 jobs:
   prepare:
+    # The loop guard finds this job by name. Keep it.
+    name: merge-queue-prepare
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -356,8 +358,8 @@ jobs:
           queue_workflow=${queue_workflow##*/}
           [ -n "$queue_workflow" ] || queue_workflow=merge-queue.yml
 
-          # Loop guard. A queue error is a run whose prepare or finish job failed. A PR's failed
-          # tests aren't one. If the history can't be read, don't restart.
+          # Loop guard. A queue error is a run whose merge-queue-prepare or merge-queue-finish job
+          # failed. A PR's failed tests aren't one. If the history can't be read, don't restart.
           no_restart() {
             echo "::error::$1 so it doesn't start the queue again. Fix the cause, then run $queue_workflow by hand."
             exit 0
@@ -372,7 +374,10 @@ jobs:
             failed_jobs=$(gh api --paginate "repos/$REPO/actions/runs/$id/jobs?filter=latest&per_page=100" \
                 --jq '.jobs[] | select(.conclusion == "failure") | .name') \
               || no_restart "Couldn't read the jobs of run $id,"
-            if grep -qE '^(prepare|finish) / ' <<< "$failed_jobs"; then errors=$((errors + 1)); fi
+            # A failed run with no failed job at all also counts, so the guard fails closed.
+            if [ -z "$failed_jobs" ] || grep -qE '(^| / )merge-queue-(prepare|finish)$' <<< "$failed_jobs"; then
+              errors=$((errors + 1))
+            fi
           done <<< "$runs"
           echo "Queue errors in the 2 finished runs before this one: $errors."
           [ "$errors" -lt 2 ] || no_restart "This is the third queue error in a row,"
