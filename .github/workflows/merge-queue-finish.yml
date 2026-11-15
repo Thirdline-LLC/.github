@@ -1,0 +1,474 @@
+name: merge-queue-finish
+# Shared merge queue, step 2 of 2. Merges or rejects the PR that prepare picked, then keeps the
+# queue moving. Called from each repo's merge-queue.yml. How it works: merge-queue/README.md.
+
+on:
+  workflow_call:
+    inputs:
+      pr:
+        description: PR number from prepare.
+        type: string
+        required: true
+      head_sha:
+        description: PR head SHA from prepare.
+        type: string
+        required: false
+        default: ''
+      base_sha:
+        description: Default-branch SHA the test merge was built on.
+        type: string
+        required: false
+        default: ''
+      state:
+        description: State from prepare (ready, test, conflict, invalid, cancelled).
+        type: string
+        required: true
+      test_result:
+        description: success or failure of this repo's CI on the test merge.
+        type: string
+        required: false
+        default: failure
+      post_merge:
+        description: Space-separated workflow files to start on the default branch after a merge.
+        type: string
+        required: false
+        default: ''
+      label:
+        description: Label that queues a PR.
+        type: string
+        required: false
+        default: merge-queue
+      status_context:
+        description: Commit status the queue sets right before it merges.
+        type: string
+        required: false
+        default: merge-queue
+
+jobs:
+  finish:
+    # The loop guard finds this job by name. Keep it.
+    name: merge-queue-finish
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write       # merge the PR
+      pull-requests: write  # merge, comment, remove the label
+      statuses: write       # set the merge-queue status
+      actions: write        # start post-merge workflows and the next queue run
+      checks: read          # PR head check runs
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ inputs.pr }}
+      HEAD_SHA: ${{ inputs.head_sha }}
+      BASE_SHA: ${{ inputs.base_sha }}
+      STATE: ${{ inputs.state }}
+      TEST_RESULT: ${{ inputs.test_result }}
+      POST_MERGE: ${{ inputs.post_merge }}
+      LABEL: ${{ inputs.label }}
+      STATUS_CONTEXT: ${{ inputs.status_context }}
+      # The caller's workflow file, so the queue can start itself again.
+      CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+      # How long to wait for the PR's own required checks before merging.
+      CHECKS_WAIT_SECONDS: '1800'
+    steps:
+      - name: Merge or reject the PR
+        id: act
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! [[ "$PR" =~ ^[0-9]+$ ]]; then
+            echo "::error::Input pr must be a PR number, got '$PR'."
+            exit 1
+          fi
+          uri() { jq -rn --arg s "$1" '$s|@uri'; }
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          base_branch=$(gh api "repos/$REPO" --jq .default_branch)
+          if [ "$base_branch" = main ]; then base_name=Main; else base_name="\`$base_branch\`"; fi
+
+          # Post a comment once. The hidden marker makes re-runs skip it.
+          comment_once() {
+            local key=$1 body=$2 marker existing
+            marker="<!-- merge-queue:$key -->"
+            existing=$(gh api --paginate "repos/$REPO/issues/$PR/comments" --jq '.[].body')
+            if grep -qF -- "$marker" <<< "$existing"; then
+              echo "Comment '$key' already posted."
+              return 0
+            fi
+            gh api "repos/$REPO/issues/$PR/comments" -f body="$body
+          $marker" > /dev/null
+          }
+
+          # What happened to the PR. The EXIT trap uses it so a success status never outlives
+          # a run that didn't merge.
+          status_success=0
+          outcome=open   # open, merged, rejected or hand-merge
+
+          set_status() {  # state, description
+            [ -n "$HEAD_SHA" ] || return 0
+            gh api "repos/$REPO/statuses/$HEAD_SHA" \
+              -f state="$1" -f context="$STATUS_CONTEXT" \
+              -f description="${2:0:140}" -f target_url="$run_url" > /dev/null
+            echo "Status $STATUS_CONTEXT=$1 on ${HEAD_SHA:0:7}."
+            if [ "$1" = success ]; then status_success=1; else status_success=0; fi
+          }
+
+          on_exit() {
+            local rc=$?
+            if [ "$status_success" = 1 ] && [ "$outcome" = open ]; then
+              set_status pending "Not merged yet. The queue will test it again." || true
+            fi
+            exit "$rc"
+          }
+          trap on_exit EXIT
+
+          # 0: the PR has the label. 1: it doesn't. 2: GitHub didn't answer.
+          has_label() {
+            local labels
+            labels=$(gh api "repos/$REPO/pulls/$PR" --jq '.labels[].name') || return 2
+            grep -qxF -- "$LABEL" <<< "$labels"
+          }
+
+          # Remove the label and check it's gone. If it stays, or the check fails, fail: the queue
+          # would pick it again.
+          remove_label() {
+            local attempt rc
+            for attempt in 1 2; do
+              gh api -X DELETE "repos/$REPO/issues/$PR/labels/$(uri "$LABEL")" > /dev/null 2>&1 || true
+              rc=0
+              has_label || rc=$?
+              if [ "$rc" = 1 ]; then
+                echo "Label '$LABEL' removed from #$PR."
+                return 0
+              fi
+              echo "Label '$LABEL' may still be on #$PR (attempt $attempt)."
+              sleep 3
+            done
+            echo "::error::Couldn't remove the '$LABEL' label from #$PR."
+            return 1
+          }
+
+          # Take the PR out of the queue: failure status, no label, one plain comment.
+          reject() {  # key, message
+            set_status failure "Not merged. See the PR comment."
+            outcome=rejected
+            remove_label
+            comment_once "reject:$1:$GITHUB_RUN_ID" "$2 [Run]($run_url)"
+          }
+
+          # Required checks on the default branch (classic protection + rulesets), minus our own.
+          required_contexts() {
+            {
+              gh api "repos/$REPO/branches/$(uri "$base_branch")" \
+                --jq '.protection.required_status_checks.contexts[]?' 2>/dev/null || true
+              gh api --paginate "repos/$REPO/rules/branches/$(uri "$base_branch")" \
+                --jq '.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context' 2>/dev/null || true
+            } | grep -vxF -- "$STATUS_CONTEXT" | sort -u || true
+          }
+
+          # success, pending or failure for one check name on one commit.
+          context_state() {
+            local sha=$1 ctx=$2 run st
+            run=$(gh api --paginate "repos/$REPO/commits/$sha/check-runs?check_name=$(uri "$ctx")&filter=latest&per_page=100" \
+                --jq '.check_runs[]' \
+              | jq -rs 'sort_by(.id) | last | if . == null then "" else "\(.status):\(.conclusion // "")" end')
+            case "$run" in
+              completed:success|completed:neutral|completed:skipped) echo success; return ;;
+              completed:*) echo failure; return ;;
+              ?*) echo pending; return ;;
+            esac
+            st=$(gh api --paginate "repos/$REPO/commits/$sha/status?per_page=100" --jq '.statuses[]' \
+              | jq -rs --arg c "$ctx" 'map(select(.context == $c)) | first | .state // ""')
+            case "$st" in
+              success) echo success ;;
+              failure|error) echo failure ;;
+              *) echo pending ;;
+            esac
+          }
+
+          # Sets checks_state (success, pending, failure, unknown) and failed_checks for a commit.
+          check_required() {
+            local sha=$1 ctx s
+            local -a ctxs
+            checks_state=success
+            failed_checks=""
+            if [ -z "$required" ]; then
+              checks_state=unknown
+              return
+            fi
+            mapfile -t ctxs <<< "$required"
+            for ctx in "${ctxs[@]}"; do
+              s=$(context_state "$sha" "$ctx")
+              echo "  $ctx: $s"
+              if [ "$s" = failure ]; then
+                checks_state=failure
+                failed_checks="${failed_checks:+$failed_checks, }$ctx"
+              elif [ "$s" = pending ] && [ "$checks_state" != failure ]; then
+                checks_state=pending
+              fi
+            done
+          }
+
+          pull=$(gh api "repos/$REPO/pulls/$PR")
+          pr_state=$(jq -r .state <<< "$pull")
+          merged=$(jq -r .merged <<< "$pull")
+          cur_head=$(jq -r .head.sha <<< "$pull")
+          echo "PR #$PR: state=$pr_state merged=$merged head=$cur_head queue state=$STATE test_result=$TEST_RESULT"
+
+          # Closed or merged some other way: just take it out of the queue.
+          if [ "$pr_state" != open ]; then
+            echo "PR #$PR is no longer open (merged=$merged)."
+            outcome=rejected
+            remove_label
+            exit 0
+          fi
+
+          case "$STATE" in
+            conflict)
+              reject conflict "This PR conflicts with $base_branch. Update the branch, then add the \`$LABEL\` label again."
+              exit 0 ;;
+
+            invalid)
+              draft=$(jq -r .draft <<< "$pull")
+              pr_base=$(jq -r .base.ref <<< "$pull")
+              head_repo=$(jq -r '.head.repo.full_name // ""' <<< "$pull")
+              if [ "$draft" = true ]; then
+                reason="This PR is a draft. Mark it ready for review, then add the \`$LABEL\` label again."
+              elif [ "$pr_base" != "$base_branch" ]; then
+                reason="This PR targets \`$pr_base\`. The queue only merges into \`$base_branch\`."
+              elif [ "$head_repo" != "$REPO" ]; then
+                reason="This PR comes from a fork. The queue only merges branches in this repo."
+              else
+                required=$(required_contexts)
+                check_required "$cur_head"
+                base_now=$(gh api "repos/$REPO/git/ref/heads/$(uri "$base_branch")" --jq .object.sha)
+                ahead_by=$(gh api "repos/$REPO/compare/$base_now...$cur_head" --jq .ahead_by)
+                if [ "$checks_state" = failure ]; then
+                  reason="A required check failed on this PR: $failed_checks. Fix it, then add the \`$LABEL\` label again."
+                elif [ "$checks_state" = pending ]; then
+                  reason="This PR's checks hadn't passed yet. Add the \`$LABEL\` label again once they pass."
+                elif [ "$ahead_by" = 0 ]; then
+                  reason="Everything in this PR is already in $base_branch, so there is nothing to merge."
+                else
+                  reason="The queue couldn't check this PR. Add the \`$LABEL\` label again to retry."
+                fi
+              fi
+              reject invalid "$reason"
+              exit 0 ;;
+
+            cancelled)
+              reject cancelled "The queue run was cancelled, so it didn't merge this PR. Add the \`$LABEL\` label again to retry."
+              exit 0 ;;
+
+            ready|test) ;;
+
+            *)
+              # Fail, so the cleanup step takes the PR out of the queue and the loop guard applies.
+              echo "::error::Unknown state '$STATE' for PR #$PR."
+              exit 1 ;;
+          esac
+
+          if [ "$STATE" = test ] && [ "$TEST_RESULT" != success ]; then
+            jobs=$(gh api --paginate "repos/$REPO/actions/runs/$GITHUB_RUN_ID/attempts/${GITHUB_RUN_ATTEMPT:-1}/jobs" \
+              --jq '.jobs[] | "\(.name)=\(.conclusion)"' 2>/dev/null || true)
+            # A real failure can cancel sibling jobs (fail-fast), so it wins over "cancelled".
+            if grep -q '=cancelled$' <<< "$jobs" && ! grep -q '=failure$' <<< "$jobs"; then
+              reject cancelled "Testing was cancelled, so the queue didn't merge this PR. Add the \`$LABEL\` label again to retry."
+            else
+              reject tests "Tests failed against $base_branch \`${BASE_SHA:0:7}\`. Fix them, then add the \`$LABEL\` label again."
+            fi
+            exit 0
+          fi
+
+          # 1. The PR's own required checks must be green on its head, or GitHub won't merge.
+          required=$(required_contexts)
+          echo "Required checks besides '$STATUS_CONTEXT': ${required//$'\n'/, }"
+          waited=0
+          while :; do
+            check_required "$HEAD_SHA"
+            [ "$checks_state" != pending ] && break
+            if [ "$waited" -ge "$CHECKS_WAIT_SECONDS" ]; then
+              break
+            fi
+            sleep 20
+            waited=$((waited + 20))
+          done
+          if [ "$checks_state" = failure ]; then
+            reject checks "Tests passed against $base_branch, but a required check failed on this PR: $failed_checks. Fix it, then add the \`$LABEL\` label again."
+            exit 0
+          fi
+          if [ "$checks_state" = pending ]; then
+            reject checks-timeout "Tests passed against $base_branch, but this PR's own checks didn't finish in time. Add the \`$LABEL\` label again once they pass."
+            exit 0
+          fi
+
+          # 2. Still queued, still based on the default branch, and nothing moved while we tested.
+          pull=$(gh api "repos/$REPO/pulls/$PR")
+          if ! jq -e --arg l "$LABEL" 'any(.labels[]; .name == $l)' <<< "$pull" > /dev/null; then
+            echo "Someone removed the '$LABEL' label while testing. Leaving PR #$PR alone."
+            comment_once "unlabeled:$HEAD_SHA:$GITHUB_RUN_ID" "The \`$LABEL\` label was removed, so the queue stopped and didn't merge this PR."
+            exit 0
+          fi
+          pr_base=$(jq -r .base.ref <<< "$pull")
+          if [ "$pr_base" != "$base_branch" ]; then
+            reject invalid "This PR now targets \`$pr_base\`. The queue only merges into \`$base_branch\`."
+            exit 0
+          fi
+          title=$(jq -r .title <<< "$pull")
+          cur_head=$(jq -r .head.sha <<< "$pull")
+          cur_base=$(gh api "repos/$REPO/git/ref/heads/$(uri "$base_branch")" --jq .object.sha)
+          if [ "$cur_head" != "$HEAD_SHA" ]; then
+            echo "PR head moved: $HEAD_SHA -> $cur_head."
+            comment_once "moved-head:$HEAD_SHA:$BASE_SHA" "This PR changed while testing. Testing again."
+            exit 0
+          fi
+          if [ "$cur_base" != "$BASE_SHA" ]; then
+            echo "$base_branch moved: $BASE_SHA -> $cur_base."
+            comment_once "moved-base:$HEAD_SHA:$BASE_SHA" "$base_name moved while testing. Testing again."
+            exit 0
+          fi
+
+          # 3. Mark it tested, then merge with the head pinned. If anything below fails before the
+          #    merge, the EXIT trap puts the status back to pending.
+          err_file="$RUNNER_TEMP/merge-error.txt"
+          set_status success "Tested against $base_branch ${BASE_SHA:0:7}"
+          if out=$(gh api -X PUT "repos/$REPO/pulls/$PR/merge" \
+                -f merge_method=squash -f sha="$HEAD_SHA" -f commit_title="$title (#$PR)" 2> "$err_file"); then
+            outcome=merged
+            merged_sha=$(jq -r .sha <<< "$out")
+            echo "Merged #$PR as $merged_sha."
+            # A label left on a merged PR is harmless (the queue only reads open PRs), so carry on
+            # and start the post-merge workflows anyway.
+            remove_label || echo "::warning::#$PR merged, but its '$LABEL' label is still on it."
+            comment_once "merged" "Merged as \`${merged_sha:0:7}\`." \
+              || echo "::warning::Couldn't comment on #$PR."
+            # Merges made with the workflow token don't fire push workflows, so start them here.
+            for wf in $POST_MERGE; do
+              if gh workflow run "$wf" -R "$REPO" --ref "$base_branch"; then
+                echo "Started $wf on $base_branch."
+              else
+                echo "::warning::Couldn't start $wf on $base_branch."
+              fi
+            done
+            exit 0
+          fi
+
+          # The merge was refused.
+          message=$(jq -r '.message // empty' <<< "${out:-}" 2>/dev/null || true)
+          [ -n "$message" ] || message=$(cat "$err_file")
+          echo "GitHub refused the merge: $message"
+          # Something moved between the re-check and the merge: keep the label and test again.
+          # (The EXIT trap sets the status back to pending.)
+          if grep -qi 'head branch was modified' <<< "$message"; then
+            comment_once "moved-head:$HEAD_SHA:$BASE_SHA" "This PR changed while testing. Testing again."
+            exit 0
+          fi
+          if grep -qi 'base branch was modified' <<< "$message"; then
+            comment_once "moved-base:$HEAD_SHA:$BASE_SHA" "$base_name moved while testing. Testing again."
+            exit 0
+          fi
+          # GitHub's refusal of workflow file changes for a token without the workflows permission.
+          # In testing it let the workflow token merge them, so this is a fallback. Keep the success
+          # status so a person can merge this exact head.
+          if grep -qiE 'refusing to allow .*(create or update )?workflow' <<< "$message"; then
+            outcome=hand-merge
+            remove_label
+            comment_once "workflows:$HEAD_SHA:$BASE_SHA" "Tests passed against $base_branch. GitHub doesn't let the queue merge workflow changes: merge it with \`gh pr merge $PR --squash\`."
+            exit 0
+          fi
+          reject refused "Tests passed, but GitHub refused the merge: $message"
+
+      - name: Take the PR out of the queue after an error
+        id: cleanup
+        if: failure() && steps.act.outcome == 'failure'
+        shell: bash
+        run: |
+          set -uo pipefail
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          [[ "$PR" =~ ^[0-9]+$ ]] || exit 1
+          label_uri=$(jq -rn --arg s "$LABEL" '$s|@uri')
+          gh api -X DELETE "repos/$REPO/issues/$PR/labels/$label_uri" > /dev/null 2>&1 || true
+          pull=$(gh api "repos/$REPO/pulls/$PR") || exit 1
+          if [ "$(jq -r .merged <<< "$pull")" != true ]; then
+            if [ -n "$HEAD_SHA" ]; then
+              gh api "repos/$REPO/statuses/$HEAD_SHA" -f state=failure -f context="$STATUS_CONTEXT" \
+                -f description="The queue hit an error. See the PR comment." -f target_url="$run_url" > /dev/null || true
+            fi
+            marker="<!-- merge-queue:error:$GITHUB_RUN_ID -->"
+            existing=$(gh api --paginate "repos/$REPO/issues/$PR/comments" --jq '.[].body' || true)
+            if ! grep -qF -- "$marker" <<< "$existing"; then
+              gh api "repos/$REPO/issues/$PR/comments" -f body="The queue hit an error with this PR and took it out of the queue. Add the \`$LABEL\` label again to retry. [Run]($run_url)
+          $marker" > /dev/null || true
+            fi
+          fi
+          if ! labels=$(gh api "repos/$REPO/pulls/$PR" --jq '.labels[].name'); then
+            echo "::error::Couldn't check whether the '$LABEL' label is still on #$PR."
+            exit 1
+          fi
+          if grep -qxF -- "$LABEL" <<< "$labels"; then
+            echo "::error::The '$LABEL' label is still on #$PR. Remove it by hand, or the queue will pick it again."
+            exit 1
+          fi
+          echo "Took #$PR out of the queue."
+
+      - name: Continue the queue
+        if: always()
+        shell: bash
+        env:
+          ACT_OUTCOME: ${{ steps.act.outcome }}
+          CLEANUP_OUTCOME: ${{ steps.cleanup.outcome }}
+        run: |
+          set -euo pipefail
+          # Delete the temporary test branch prepare may have made for this run.
+          gh api -X DELETE "repos/$REPO/git/refs/heads/merge-queue/test-$PR-$GITHUB_RUN_ID" > /dev/null 2>&1 \
+            && echo "Deleted merge-queue/test-$PR-$GITHUB_RUN_ID." || true
+          base_branch=$(gh api "repos/$REPO" --jq .default_branch)
+          queue_workflow=${CALLER_WORKFLOW_REF%@*}
+          queue_workflow=${queue_workflow##*/}
+          [ -n "$queue_workflow" ] || queue_workflow=merge-queue.yml
+
+          # Start the next run only when this PR's fate is settled: finish ran cleanly, or it hit
+          # an error and the cleanup step took the PR out of the queue.
+          if [ "$ACT_OUTCOME" != success ]; then
+            if [ "$CLEANUP_OUTCOME" != success ]; then
+              echo "::error::This run stopped before PR #$PR left the queue, so it doesn't start the queue again."
+              exit 0
+            fi
+            # Loop guard. A queue error is a run whose merge-queue-prepare or merge-queue-finish job
+            # failed. A PR's failed tests aren't one. If the history can't be read, don't restart.
+            no_restart() {
+              echo "::error::$1 so it doesn't start the queue again. Fix the cause, then run $queue_workflow by hand."
+              exit 0
+            }
+            runs=$(gh run list -R "$REPO" --workflow "$queue_workflow" --status completed --limit 20 \
+                --json databaseId,conclusion \
+                --jq '[.[] | select(.conclusion == "success" or .conclusion == "failure")][:2] | .[] | "\(.databaseId) \(.conclusion)"') \
+              || no_restart "Couldn't read the queue's run history,"
+            errors=0
+            while read -r id conclusion; do
+              [ "$conclusion" = failure ] || continue
+              failed_jobs=$(gh api --paginate "repos/$REPO/actions/runs/$id/jobs?filter=latest&per_page=100" \
+                  --jq '.jobs[] | select(.conclusion == "failure") | .name') \
+                || no_restart "Couldn't read the jobs of run $id,"
+              # A failed run with no failed job at all also counts, so the guard fails closed.
+              if [ -z "$failed_jobs" ] || grep -qE '(^| / )merge-queue-(prepare|finish)$' <<< "$failed_jobs"; then
+                errors=$((errors + 1))
+              fi
+            done <<< "$runs"
+            echo "Queue errors in the 2 finished runs before this one: $errors."
+            [ "$errors" -lt 2 ] || no_restart "This is the third queue error in a row,"
+          fi
+
+          waiting=$(gh api graphql \
+            -f owner="${REPO%%/*}" -f name="${REPO#*/}" -f label="$LABEL" \
+            -f query='
+              query($owner: String!, $name: String!, $label: String!) {
+                repository(owner: $owner, name: $name) {
+                  pullRequests(states: OPEN, labels: [$label]) { totalCount }
+                }
+              }' --jq '.data.repository.pullRequests.totalCount')
+          echo "$waiting PR(s) still queued."
+          if [ "$waiting" -gt 0 ]; then
+            gh workflow run "$queue_workflow" -R "$REPO" --ref "$base_branch"
+            echo "Started $queue_workflow again on $base_branch."
+          fi
