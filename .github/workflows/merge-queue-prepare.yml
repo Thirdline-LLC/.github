@@ -29,7 +29,7 @@ on:
         description: SHA of GitHub's test merge commit (latest base + PR head).
         value: ${{ jobs.prepare.outputs.test_ref }}
       state:
-        description: none, ready, test, conflict or invalid.
+        description: none, ready, test, conflict, invalid or cancelled.
         value: ${{ jobs.prepare.outputs.state }}
 
 jobs:
@@ -320,6 +320,9 @@ jobs:
           state=$(get state)
           if [ -z "$pr" ]; then
             state=none
+          elif [ "$PICK_OUTCOME" = cancelled ]; then
+            echo "::warning::The run was cancelled while checking PR #$pr."
+            state=cancelled
           elif [ "$PICK_OUTCOME" != success ]; then
             echo "::error::The queue hit an error while checking PR #$pr. It will be taken out of the queue."
             state=invalid
@@ -341,8 +344,8 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Start the queue again after an error
-        # The run failed before it picked a PR, so finish won't run. Try once more, unless the 2
-        # finished runs before this one failed too.
+        # The run failed before it picked a PR, so finish won't run. Try again, unless the queue
+        # itself failed in the 2 finished runs before this one too.
         if: failure() && steps.out.outputs.pr == ''
         shell: bash
         env:
@@ -352,12 +355,26 @@ jobs:
           queue_workflow=${CALLER_WORKFLOW_REF%@*}
           queue_workflow=${queue_workflow##*/}
           [ -n "$queue_workflow" ] || queue_workflow=merge-queue.yml
-          recent=$(gh run list -R "$REPO" --workflow "$queue_workflow" --status completed --limit 20 \
-            --json conclusion --jq '[.[] | select(.conclusion == "success" or .conclusion == "failure") | .conclusion][:2] | join(" ")')
-          echo "Previous finished queue runs: $recent."
-          if [ "$recent" = "failure failure" ]; then
-            echo "::error::This is the third failed queue run in a row, so it doesn't start the queue again. Fix the cause, then run $queue_workflow by hand."
+
+          # Loop guard. A queue error is a run whose prepare or finish job failed. A PR's failed
+          # tests aren't one. If the history can't be read, don't restart.
+          no_restart() {
+            echo "::error::$1 so it doesn't start the queue again. Fix the cause, then run $queue_workflow by hand."
             exit 0
-          fi
+          }
+          runs=$(gh run list -R "$REPO" --workflow "$queue_workflow" --status completed --limit 20 \
+              --json databaseId,conclusion \
+              --jq '[.[] | select(.conclusion == "success" or .conclusion == "failure")][:2] | .[] | "\(.databaseId) \(.conclusion)"') \
+            || no_restart "Couldn't read the queue's run history,"
+          errors=0
+          while read -r id conclusion; do
+            [ "$conclusion" = failure ] || continue
+            failed_jobs=$(gh api --paginate "repos/$REPO/actions/runs/$id/jobs?filter=latest&per_page=100" \
+                --jq '.jobs[] | select(.conclusion == "failure") | .name') \
+              || no_restart "Couldn't read the jobs of run $id,"
+            if grep -qE '^(prepare|finish) / ' <<< "$failed_jobs"; then errors=$((errors + 1)); fi
+          done <<< "$runs"
+          echo "Queue errors in the 2 finished runs before this one: $errors."
+          [ "$errors" -lt 2 ] || no_restart "This is the third queue error in a row,"
           gh workflow run "$queue_workflow" -R "$REPO" --ref "$(gh api "repos/$REPO" --jq .default_branch)"
           echo "Started $queue_workflow again."

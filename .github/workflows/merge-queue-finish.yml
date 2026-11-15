@@ -20,7 +20,7 @@ on:
         required: false
         default: ''
       state:
-        description: State from prepare (ready, test, conflict, invalid).
+        description: State from prepare (ready, test, conflict, invalid, cancelled).
         type: string
         required: true
       test_result:
@@ -254,6 +254,10 @@ jobs:
               reject invalid "$reason"
               exit 0 ;;
 
+            cancelled)
+              reject cancelled "The queue run was cancelled, so it didn't merge this PR. Add the \`$LABEL\` label again to retry."
+              exit 0 ;;
+
             ready|test) ;;
 
             *)
@@ -265,7 +269,8 @@ jobs:
           if [ "$STATE" = test ] && [ "$TEST_RESULT" != success ]; then
             jobs=$(gh api --paginate "repos/$REPO/actions/runs/$GITHUB_RUN_ID/attempts/${GITHUB_RUN_ATTEMPT:-1}/jobs" \
               --jq '.jobs[] | "\(.name)=\(.conclusion)"' 2>/dev/null || true)
-            if grep -q '=cancelled$' <<< "$jobs"; then
+            # A real failure can cancel sibling jobs (fail-fast), so it wins over "cancelled".
+            if grep -q '=cancelled$' <<< "$jobs" && ! grep -q '=failure$' <<< "$jobs"; then
               reject cancelled "Testing was cancelled, so the queue didn't merge this PR. Add the \`$LABEL\` label again to retry."
             else
               reject tests "Tests failed against $base_branch \`${BASE_SHA:0:7}\`. Fix them, then add the \`$LABEL\` label again."
@@ -394,7 +399,10 @@ jobs:
           $marker" > /dev/null || true
             fi
           fi
-          labels=$(gh api "repos/$REPO/pulls/$PR" --jq '.labels[].name' || true)
+          if ! labels=$(gh api "repos/$REPO/pulls/$PR" --jq '.labels[].name'); then
+            echo "::error::Couldn't check whether the '$LABEL' label is still on #$PR."
+            exit 1
+          fi
           if grep -qxF -- "$LABEL" <<< "$labels"; then
             echo "::error::The '$LABEL' label is still on #$PR. Remove it by hand, or the queue will pick it again."
             exit 1
@@ -424,14 +432,26 @@ jobs:
               echo "::error::This run stopped before PR #$PR left the queue, so it doesn't start the queue again."
               exit 0
             fi
-            # Loop guard: this run failed. Don't restart if the 2 finished runs before it failed too.
-            recent=$(gh run list -R "$REPO" --workflow "$queue_workflow" --status completed --limit 20 \
-              --json conclusion --jq '[.[] | select(.conclusion == "success" or .conclusion == "failure") | .conclusion][:2] | join(" ")')
-            echo "Previous finished queue runs: $recent."
-            if [ "$recent" = "failure failure" ]; then
-              echo "::error::This is the third failed queue run in a row, so it doesn't start the queue again. Fix the cause, then run $queue_workflow by hand."
+            # Loop guard. A queue error is a run whose prepare or finish job failed. A PR's failed
+            # tests aren't one. If the history can't be read, don't restart.
+            no_restart() {
+              echo "::error::$1 so it doesn't start the queue again. Fix the cause, then run $queue_workflow by hand."
               exit 0
-            fi
+            }
+            runs=$(gh run list -R "$REPO" --workflow "$queue_workflow" --status completed --limit 20 \
+                --json databaseId,conclusion \
+                --jq '[.[] | select(.conclusion == "success" or .conclusion == "failure")][:2] | .[] | "\(.databaseId) \(.conclusion)"') \
+              || no_restart "Couldn't read the queue's run history,"
+            errors=0
+            while read -r id conclusion; do
+              [ "$conclusion" = failure ] || continue
+              failed_jobs=$(gh api --paginate "repos/$REPO/actions/runs/$id/jobs?filter=latest&per_page=100" \
+                  --jq '.jobs[] | select(.conclusion == "failure") | .name') \
+                || no_restart "Couldn't read the jobs of run $id,"
+              if grep -qE '^(prepare|finish) / ' <<< "$failed_jobs"; then errors=$((errors + 1)); fi
+            done <<< "$runs"
+            echo "Queue errors in the 2 finished runs before this one: $errors."
+            [ "$errors" -lt 2 ] || no_restart "This is the third queue error in a row,"
           fi
 
           waiting=$(gh api graphql \

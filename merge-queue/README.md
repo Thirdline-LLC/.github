@@ -29,7 +29,7 @@ What the queue's comments mean:
 | Already up to date with main and checks passed. It will merge if nothing changes. | Nothing to re-test. |
 | Merged as `abc1234`. | Done. The label is gone. Main's push workflows were started. |
 | Tests failed against main `abc1234`. | The PR breaks on the latest `main`. The label is gone. Fix it and queue it again. |
-| Testing was cancelled. | Someone cancelled the run. The label is gone. Queue it again. |
+| Testing was cancelled. / The queue run was cancelled. | Someone cancelled the run. The label is gone. Queue it again. |
 | The queue hit an error with this PR. | Something broke in the queue itself. The label is gone. Queue it again. |
 | The label was removed, so the queue stopped. | Someone took it out of the queue mid-test. |
 | This PR conflicts with main. | Merge `main` into the branch, fix the conflict, queue it again. |
@@ -60,7 +60,7 @@ Each repo has two small workflows. The shared logic lives here, in
      workflows on `main`, because merges made with the workflow token don't fire `push`.
    - Each run handles one PR. If more PRs have the label, finish starts the queue again.
    - If a run hits an error, finish takes that PR out of the queue with a comment, then starts
-     the queue again for the others. It doesn't restart after the third failed run in a row.
+     the queue again for the others. It doesn't restart after its third error in a row.
      If the run fails before it picks a PR, prepare restarts it, with the same limit.
      A run cancelled before its PR leaves the queue doesn't restart: run `merge-queue.yml` by
      hand.
@@ -86,7 +86,7 @@ parents. finish deletes that branch, and the next prepare deletes any that were 
 | `head_sha` | PR head SHA when picked |
 | `base_sha` | `main` SHA the test is based on |
 | `test_ref` | SHA to test: the test merge, or the PR head when it is already up to date |
-| `state` | `none`, `ready`, `test`, `conflict` or `invalid` |
+| `state` | `none`, `ready`, `test`, `conflict`, `invalid` or `cancelled` |
 
 Inputs (both optional): `label` (default `merge-queue`) and `status_context` (default
 `merge-queue`).
@@ -170,9 +170,10 @@ Actions app and a ruleset that requires PRs:
 - **The queue waits up to 30 minutes** for a PR's own required checks. Longer than that, it
   takes the PR out of the queue.
 - **Forks aren't supported.** The queue runs PR code in the base repo.
-- **Restarts are limited.** After an error the queue restarts itself, but not after 3 failed runs
-  in a row. A run whose tests failed also counts as a failed run here. A run cancelled before its
-  PR leaves the queue, or a run whose PR keeps its label, doesn't restart. Then fix the cause and
+- **Restarts are limited.** After an error the queue restarts itself, but not after its third
+  error in a row. An error is a run whose `prepare` or `finish` job failed. A PR whose tests
+  failed isn't one. It also doesn't restart when it can't read its own run history, when a run is
+  cancelled before its PR leaves the queue, or when a PR keeps its label. Then fix the cause and
   run `merge-queue.yml` by hand. If the label can't be removed, the run fails loudly and the PR
   needs a person.
 - **Billing.** Each queue run is a few short jobs, and private repos pay at least a minute per
