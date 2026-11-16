@@ -16,6 +16,8 @@ concurrency:
 jobs:
   prepare:
     uses: Thirdline-LLC/.github/.github/workflows/merge-queue-prepare.yml@v1
+    with:
+      runs_on: ${{ vars.MERGE_QUEUE_RUNS_ON }}   # see "Choosing the runner" in the README
 
   # This repo's required checks, run on the PR merged into the latest main.
   checks:                      # one job per CI workflow file; name it after the file
@@ -42,3 +44,4 @@ jobs:
       # Only success counts: a failed, cancelled or skipped CI job is a failure.
       test_result: ${{ (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')) && 'failure' || 'success' }}
       post_merge: checks.yml   # space-separated; workflows that run on push to main
+      runs_on: ${{ vars.MERGE_QUEUE_RUNS_ON }}
