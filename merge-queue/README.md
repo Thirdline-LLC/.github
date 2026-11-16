@@ -88,15 +88,15 @@ parents. finish deletes that branch, and the next prepare deletes any that were 
 | `test_ref` | SHA to test: the test merge, or the PR head when it is already up to date |
 | `state` | `none`, `ready`, `test`, `conflict`, `invalid` or `cancelled` |
 
-Inputs (both optional): `label` (default `merge-queue`) and `status_context` (default
-`merge-queue`).
+Inputs (all optional): `label` (default `merge-queue`), `status_context` (default
+`merge-queue`) and `runs_on` (see "Choosing the runner").
 
 ### finish inputs
 
 `pr`, `head_sha`, `base_sha`, `state` and `test_result` (`success` or `failure`) from the
 caller. Only `success` counts as passed: the template turns a failed, cancelled or skipped CI job
 into `failure`. `post_merge`: space-separated workflow files to start on `main` after a merge. `label` and
-`status_context` as above.
+`status_context` and `runs_on` as above.
 
 ## Installing it in a repo
 
@@ -136,6 +136,25 @@ Do the file changes in a branch and a PR like any other change.
 4. **Check it with a test PR.** Queue a one-line PR. You should see `merge-queue-kick`, then
    `merge-queue`, then "Queued: ..." and "Merged as ..." on the PR, and main's push workflows
    starting.
+
+## Choosing the runner
+
+The queue's jobs run on `ubuntu-latest` unless the repo variable `MERGE_QUEUE_RUNS_ON` says
+otherwise. Set it to the runner's labels as JSON:
+
+```bash
+gh variable set MERGE_QUEUE_RUNS_ON -R OWNER/REPO --body '["self-hosted","my-queue-runner"]'
+gh variable delete MERGE_QUEUE_RUNS_ON -R OWNER/REPO   # back to ubuntu-latest
+```
+
+The template passes it to prepare and finish as `runs_on`, and `merge-queue-kick.yml` reads it
+too. A run reads it when it starts. The runner needs `gh` and `jq`.
+
+Don't give the queue a runner that also runs PR code. Its jobs hold a token that can merge and
+can set the `merge-queue` status. A self-hosted runner keeps its files between jobs, so a PR's
+tests, or a package they install, could leave something behind for the next queue job on that
+runner. GitHub-hosted runners start clean every time. A self-hosted queue runner needs its own
+user and its own label, one that no CI workflow asks for.
 
 ## The workflow token
 

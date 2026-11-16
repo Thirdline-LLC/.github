@@ -15,6 +15,13 @@ on:
         type: string
         required: false
         default: merge-queue
+      runs_on:
+        description: >-
+          Runner for this job, as JSON: '"ubuntu-latest"' or '["self-hosted","my-label"]'.
+          Empty means ubuntu-latest. The runner needs gh and jq.
+        type: string
+        required: false
+        default: ''
     outputs:
       pr:
         description: PR number being processed, or empty when nothing is queued.
@@ -36,7 +43,7 @@ jobs:
   prepare:
     # The loop guard finds this job by name. Keep it.
     name: merge-queue-prepare
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on || '"ubuntu-latest"') }}
     timeout-minutes: 45
     permissions:
       contents: write       # build a test merge on a temporary branch when GitHub's is stale
