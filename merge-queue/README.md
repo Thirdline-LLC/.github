@@ -125,6 +125,12 @@ Do the file changes in a branch and a PR like any other change.
      fallback: `HEAD^1` of the test merge is the base.
    - A `concurrency` group built from `github.ref` or `github.workflow` must include
      `inputs.ref`, so a queue run never cancels main's runs.
+   - **Keep caches read-only in a called run.** The queue runs on `main`, so a called run saves
+     caches into `main`'s cache, and later runs on `main` restore them, while the code running is
+     the PR's. When `inputs.ref` is set: turn off `actions/setup-node` caching
+     (`cache: ${{ inputs.ref == '' && 'npm' || '' }}`), split `actions/cache` into
+     `actions/cache/restore` plus an `actions/cache/save` step with `if: inputs.ref == ''`, and
+     give `actions/checkout` `persist-credentials: false`. Normal push and PR runs keep caching.
    - Don't rename jobs. Required check names must still match on normal PR runs.
    - Note any secrets it uses. The queue passes none unless you name them in the caller.
 3. **Settings** (a repo admin does these):
@@ -201,6 +207,10 @@ Actions app and a ruleset that requires PRs:
 - **The queue waits up to 30 minutes** for a PR's own required checks. Longer than that, it
   takes the PR out of the queue.
 - **Forks aren't supported.** The queue runs PR code in the base repo.
+- **The PR's tests share `main`'s cache scope.** Read-only caching (step 2) stops the workflow
+  from saving a cache there, but code that runs in the job could still talk to the cache service
+  itself. So a release or deploy workflow shouldn't restore caches, and PR code the queue tests
+  (including a dependency bump) deserves the same review as code headed for `main`.
 - **Restarts are limited.** After an error the queue restarts itself, but not after its third
   error in a row. An error is a run whose `prepare` or `finish` job failed. A PR whose tests
   failed isn't one. It also doesn't restart when it can't read its own run history, when a run is
