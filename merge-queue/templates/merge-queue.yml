@@ -4,17 +4,20 @@ name: merge-queue
 # How it works: https://github.com/Thirdline-LLC/.github/blob/main/merge-queue/README.md
 on:
   workflow_dispatch:
-permissions:
-  contents: write
-  pull-requests: write
-  statuses: write
-  actions: write
-  checks: read
+# No write access by default. Only the queue's own jobs (prepare, finish) get it,
+# and only what the shared workflows declare. The CI jobs run PR code read-only.
+permissions: {}
 concurrency:
   group: merge-queue
   cancel-in-progress: false
 jobs:
   prepare:
+    permissions:               # what merge-queue-prepare.yml declares
+      contents: write
+      pull-requests: write
+      statuses: read
+      checks: read
+      actions: write
     uses: Thirdline-LLC/.github/.github/workflows/merge-queue-prepare.yml@v1
     with:
       runs_on: ${{ vars.MERGE_QUEUE_RUNS_ON }}   # see "Choosing the runner" in the README
@@ -33,6 +36,12 @@ jobs:
     #   EXAMPLE_TOKEN: ${{ secrets.EXAMPLE_TOKEN }}
 
   finish:
+    permissions:               # what merge-queue-finish.yml declares
+      contents: write
+      pull-requests: write
+      statuses: write
+      checks: read
+      actions: write
     needs: [prepare, checks]   # prepare plus every CI job
     if: always() && needs.prepare.outputs.pr != ''
     uses: Thirdline-LLC/.github/.github/workflows/merge-queue-finish.yml@v1

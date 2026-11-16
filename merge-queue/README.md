@@ -110,6 +110,9 @@ Do the file changes in a branch and a PR like any other change.
    - Each CI job keeps `permissions: contents: read` from the template, because it runs PR
      code. It gets no secrets. If that CI needs a secret, pass it by name under `secrets:`.
      Don't use `secrets: inherit`.
+   - Keep the template's `permissions: {}` at the top. Write access belongs to `prepare` and
+     `finish` only, each with exactly what its shared workflow declares, so a job added later
+     starts with none.
    - Set `post_merge` to the workflows that run on push to `main`.
 2. **Change each of those CI workflows**, and each one that runs on push to `main`:
    - Add a `workflow_call` trigger with a string input `ref` (default `''`), and
