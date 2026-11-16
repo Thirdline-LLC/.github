@@ -18,7 +18,7 @@ on:
       runs_on:
         description: >-
           Runner for this job, as JSON: '"ubuntu-latest"' or '["self-hosted","my-label"]'.
-          Empty means ubuntu-latest. The runner needs gh and jq.
+          Empty means ubuntu-latest. The runner must be Linux with gh and jq.
         type: string
         required: false
         default: ''

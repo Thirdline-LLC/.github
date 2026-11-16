@@ -140,21 +140,33 @@ Do the file changes in a branch and a PR like any other change.
 ## Choosing the runner
 
 The queue's jobs run on `ubuntu-latest` unless the repo variable `MERGE_QUEUE_RUNS_ON` says
-otherwise. Set it to the runner's labels as JSON:
+otherwise. Set it as JSON: a list of labels, or one label in double quotes. A bare word without
+the quotes stops every queue run before it starts.
 
 ```bash
 gh variable set MERGE_QUEUE_RUNS_ON -R OWNER/REPO --body '["self-hosted","my-queue-runner"]'
+gh variable set MERGE_QUEUE_RUNS_ON -R OWNER/REPO --body '"my-queue-runner"'   # one label
 gh variable delete MERGE_QUEUE_RUNS_ON -R OWNER/REPO   # back to ubuntu-latest
 ```
 
 The template passes it to prepare and finish as `runs_on`, and `merge-queue-kick.yml` reads it
-too. A run reads it when it starts. The runner needs `gh` and `jq`.
+too. A run reads it when it starts. The runner must be Linux (the scripts need bash 4 or later)
+with `gh` and `jq`. If it is offline, queue jobs wait for it (up to a day) and nothing merges:
+start it, or delete the variable.
 
 Don't give the queue a runner that also runs PR code. Its jobs hold a token that can merge and
 can set the `merge-queue` status. A self-hosted runner keeps its files between jobs, so a PR's
 tests, or a package they install, could leave something behind for the next queue job on that
-runner. GitHub-hosted runners start clean every time. A self-hosted queue runner needs its own
-user and its own label, one that no CI workflow asks for.
+runner. GitHub-hosted runners start clean every time. A self-hosted queue runner needs:
+
+- its own user, with no sudo, whose home no CI user can write;
+- a label of its own, named in `MERGE_QUEUE_RUNS_ON`. Every runner also has `self-hosted`, so
+  every CI job must ask for a label the queue runner doesn't have;
+- `gh`, `jq` and every folder on its `PATH` owned by root.
+
+That keeps out what PR tests leave behind. It doesn't stop someone with write access, who can
+point a workflow at any label (see "Known limits"). A runner that takes one job per
+registration (`--ephemeral`), or GitHub-hosted, is the stronger choice.
 
 ## The workflow token
 
