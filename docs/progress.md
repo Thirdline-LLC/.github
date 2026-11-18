@@ -118,8 +118,8 @@ still reach the Windows host and the LAN over the network.
       `DATABASE_URL`. Each workflow creates what it needs: `cclp_supply_test` for cclp, user
       `cipguser` and database `cipgdb` for scholars. The same PR per repo also does A7's cache
       check, so each CI file changes once.
-      In progress: scholars #162 (`fe` passed on the pool with `pg-start.sh`: 1,605 tests) and
-      cclp #9, both queued.
+      Part 1 done 2026-11-18: scholars #162 (`fe`, 1,605 tests) and cclp #9 merged through the
+      queue on today's pool runners with `pg-start.sh`. Part 2 (test slot) waits for A5.
       Done when: `test` (cclp) and `fe` (scholars) pass both on today's pool runners (the PR's own
       checks) and on the test slot (a branch that points `runs-on` at `thirdline-test`), before
       anything switches.
@@ -170,17 +170,28 @@ B work runs on today's runners and doesn't wait for Plan A. The scratch repo
 `Thirdline-LLC/merge-queue-scratch` (private, created for B1, deleted after B4) uses the
 `thirdline-pool` group.
 
-- [ ] **B1a. `prepare`:** always push the test branch for state `test`. Done when: on the scratch
+- [x] **B1a. `prepare`:** always push the test branch for state `test`. Done when: on the scratch
       repo, a behind PR, an up-to-date PR and a PR whose merge ref is stale each get a branch at
       the expected SHA.
-- [ ] **B1b. `merge-queue-wait.yml`:** dispatch, follow, guard, cancel. Done when, on the scratch
+- [x] **B1b. `merge-queue-wait.yml`:** dispatch, follow, guard, cancel. Done when, on the scratch
       repo: pass merges; failing tests reject; a CI file without `workflow_dispatch` rejects with
       that reason; `gh workflow run` printing no run URL (old gh) fails with a message naming the
       gh version; a dispatch that never starts a run times out and rejects; cancelling the queue
       run cancels the CI run; a PR pushed to mid-test is rejected (head moved).
-- [ ] **B1c. `finish`:** delete the branch and its caches. Done when: after a scratch run,
+- [x] **B1c. `finish`:** delete the branch and its caches. Done when: after a scratch run,
       `gh cache list --ref refs/heads/merge-queue/test-...` is empty, and a cache key written by a
       test run isn't restored by the next run on `main`.
+  **B1 done 2026-11-18** on `Thirdline-LLC/merge-queue-scratch` (default branch `trunk`), branch
+  `queue/v2` at `2a0ac5a`:
+  t1 up-to-date PR: CI ran as `workflow_dispatch` on `merge-queue/test-1-…` at the PR head, told
+  apart from the PR's own run, merged. t2 failing CI: rejected. t3 CI file without
+  `workflow_dispatch`: rejected, run says "Workflow does not have 'workflow_dispatch' trigger".
+  t4 queue run cancelled: the CI run it started was cancelled too. t5 push mid-test: "This PR
+  changed while testing". Afterwards no `merge-queue/*` branches and no caches on them.
+  Changed from the plan: `wait` gets the run id from the dispatch API (`return_run_details`)
+  instead of gh's output, because the queue runner has gh 2.45. Not exercised: the path where
+  GitHub's own merge ref is current, and a dispatch that never starts a run (timeout).
+  For B3: finish's comment says "Tests failed" for every wait failure; pass the reason through.
 - [ ] **B2. Concurrency check.** Each consumer's CI `concurrency` group (for example
       `checks-${{ inputs.ref || github.ref }}`) must give every test branch its own group, so two
       queue tests or a queue test and a `main` run never cancel each other. Done when: the group
