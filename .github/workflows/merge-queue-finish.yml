@@ -290,7 +290,7 @@ jobs:
             elif [ -n "$TEST_REASON" ]; then
               # The reason can quote CI job names and API errors: keep it to one line of plain text
               # that can't break the comment's Markdown or @-mention anyone.
-              why=$(tr -d '`@\r' <<< "$TEST_REASON" | tr '\n' ' ' | cut -c1-300)
+              why=$(tr -d '`@\r' <<< "$TEST_REASON" | tr '\n' ' ' | sed 's/  */ /g; s/ $//' | cut -c1-300)
               reject tests "Testing against $base_branch \`${BASE_SHA:0:7}\` didn't pass: $why Fix it, then add the \`$LABEL\` label again."
             else
               reject tests "Tests failed against $base_branch \`${BASE_SHA:0:7}\`. Fix them, then add the \`$LABEL\` label again."
