@@ -127,6 +127,9 @@ Do the file changes in a branch and a PR like any other change.
    - In `merge-queue.yml`, set `ci_workflows` (in the `wait` job) to every CI workflow file
      that produces a required check, space-separated. If nothing is required yet, list the CI
      files you want a PR to pass before it merges.
+   - Keep the template's `permissions: {}` at the top. Write access belongs to `prepare` and
+     `finish` only, each with exactly what its shared workflow declares; `wait` gets
+     `actions: write` and `contents: read`. A job added later starts with none.
    - Set `post_merge` to the workflows that run on push to `main`. They need a
      `workflow_dispatch` trigger too, because finish starts them that way.
 2. **Give each of those CI workflows a `workflow_dispatch` trigger.** Keep every trigger it
@@ -142,6 +145,13 @@ Do the file changes in a branch and a PR like any other change.
    - The run uses the CI file as the PR changed it, with the repo's secrets, like any push to a
      branch in the repo. Give it a workflow-level `permissions:` block with the least it needs,
      usually `contents: read`.
+   - **Caches: the test branch keeps them away from `main`.** A queue run saves caches only in
+     its own branch's scope, which finish deletes; `main` never restores them. As a second
+     guard, skip cache saves on queue branches: give `actions/setup-node`
+     `cache: ${{ !startsWith(github.ref, 'refs/heads/merge-queue/') && 'npm' || '' }}`, split
+     `actions/cache` into `actions/cache/restore` plus an `actions/cache/save` step with
+     `if: ${{ !startsWith(github.ref, 'refs/heads/merge-queue/') }}`, and give
+     `actions/checkout` `persist-credentials: false`.
    - Don't rename jobs. Required check names must still match on normal PR runs.
    - A CI workflow that is also a reusable workflow (`workflow_call` with an input `ref`, from
      v1) still works; the input is just empty. Remove it once no v1 caller is left. A file
@@ -226,6 +236,10 @@ Actions app and a ruleset that requires PRs:
 - **The queue waits up to 30 minutes** for a PR's own required checks. Longer than that, it
   takes the PR out of the queue.
 - **Forks aren't supported.** The queue runs PR code in the base repo.
+- **Test runs can read `main`'s caches.** GitHub lets any branch restore the default branch's
+  caches, so the PR's tests can read them, but they save only into the test branch's scope,
+  which the queue deletes. Code in the job could still call the cache service itself, but only
+  with that branch's scope. A release or deploy workflow still shouldn't restore caches.
 - **Restarts are limited.** After an error the queue restarts itself, but not after its third
   error in a row. An error is a run whose `prepare` or `finish` job failed. A PR whose tests
   failed isn't one. It also doesn't restart when it can't read its own run history, when a run is
@@ -247,5 +261,6 @@ mid-test.
 v2 (CI on the test branch) was tested on a scratch repo: a passing PR merged; failing CI, a CI
 file without `workflow_dispatch` and a PR pushed to mid-test were each rejected with the reason;
 cancelling the queue run cancelled its CI run; a queue test, a `main` run and a PR run at once
-didn't cancel each other; no test branches or caches were left. Details in
-[`docs/progress.md`](../docs/progress.md), B1 and B2.
+didn't cancel each other; no test branches or caches were left; and a second agent installed
+it from this README alone. Details in
+[`docs/progress.md`](../docs/progress.md), B1 to B3.
