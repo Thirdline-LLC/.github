@@ -168,14 +168,16 @@ jobs:
           owner=${REPO%%/*}
           name=${REPO#*/}
 
-          # Runs are one at a time, so any temporary test branch left now is from an old run.
+          # Runs are one at a time, so any temporary test branch, or cache on one, left now is from
+          # an old run. Caches go by ref, not by branch: a CI run still finishing after finish
+          # deleted its branch can save a cache on a ref that no longer exists.
+          for id in $(gh api --paginate "repos/$REPO/actions/caches?per_page=100" \
+              --jq '.actions_caches[] | select(.ref | test("^refs/heads/merge-queue/test-[0-9]+-[0-9]+$")) | .id' \
+              2>/dev/null || true); do
+            gh api -X DELETE "repos/$REPO/actions/caches/$id" > /dev/null 2>&1 && echo "Deleted old test cache $id." || true
+          done
           for ref in $(gh api --paginate "repos/$REPO/git/matching-refs/heads/merge-queue/test-" --jq '.[].ref'); do
             [[ "$ref" =~ ^refs/heads/merge-queue/test-[0-9]+-[0-9]+$ ]] || continue
-            # Its caches first: deleting a branch leaves them behind.
-            for id in $(gh api --paginate "repos/$REPO/actions/caches?ref=$(uri "$ref")&per_page=100" \
-                --jq '.actions_caches[].id' 2>/dev/null || true); do
-              gh api -X DELETE "repos/$REPO/actions/caches/$id" > /dev/null 2>&1 || true
-            done
             gh api -X DELETE "repos/$REPO/git/$ref" > /dev/null && echo "Deleted old ${ref#refs/heads/}."
           done
 
