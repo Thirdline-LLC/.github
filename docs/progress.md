@@ -192,10 +192,19 @@ B work runs on today's runners and doesn't wait for Plan A. The scratch repo
   instead of gh's output, because the queue runner has gh 2.45. Not exercised: the path where
   GitHub's own merge ref is current, and a dispatch that never starts a run (timeout).
   For B3: finish's comment says "Tests failed" for every wait failure; pass the reason through.
-- [ ] **B2. Concurrency check.** Each consumer's CI `concurrency` group (for example
+- [x] **B2. Concurrency check.** Each consumer's CI `concurrency` group (for example
       `checks-${{ inputs.ref || github.ref }}`) must give every test branch its own group, so two
       queue tests or a queue test and a `main` run never cancel each other. Done when: the group
       for each of the four repos is written in the PR, with a scratch run proving it.
+  **B2 done 2026-11-18.** wait dispatches with `ref` only (no `inputs.ref`), so in a queue run:
+  NFC `checks.yml` → `checks-refs/heads/merge-queue/test-<pr>-<run>`; NFC browser-tests and
+  dependency-audit → `<name>-refs/heads/merge-queue/test-…`; build-team and cclp `ci.yml` have no
+  `concurrency` (nothing cancels); scholars `checks.yml` → `checks-refs/heads/merge-queue/test-…-<sha>`.
+  `cancel-in-progress` is only true for `pull_request`, so a dispatched test is never cancelled.
+  No code change needed. Scratch proof with NFC's exact formula (scratch PR #6): queue test of
+  PR #7 ran 15:57:55–16:00:29 on pool-2; a `trunk` run (15:59:41–44) and a PR run (15:59:46–50)
+  ran inside that window on pool-1; groups `checks-refs/heads/merge-queue/test-7-44341603934`,
+  `checks-refs/heads/trunk`, `checks-refs/pull/8/merge`; all three success, none cancelled.
 - [ ] **B3. Release v2.0.0** of the shared workflows and template (no `ci` job; a `ci_workflows`
       input), README step 2 rewritten (CI needs a `workflow_dispatch` trigger). Consumers pin v2
       by commit SHA with the version in a comment, like v1.1.0 today; the tag is never moved.
