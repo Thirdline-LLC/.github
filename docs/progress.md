@@ -26,6 +26,12 @@ Facts checked 2026-11-18:
   (28-31) and no memory cap.
 - Both distros boot with systemd (`/etc/wsl.conf` `systemd=true`); the pool distro has Windows
   drives and interop turned off.
+- 2026-11-18: NFC's CodeQL scan (JavaScript, on the pool) ran the `thirdline-pool` distro out of
+  memory, the OOM killer stopped `asherpc-pool-1`, and its service stayed down
+  (`runsvc.sh` exits 0). Both pool services now have `Restart=always` (drop-in `restart.conf`).
+  The same drop-in for `tapin-ci` was not applied (the auto-mode check refused it); A8 replaces
+  those services anyway. Two pool runners are also too few: kicks wait behind CodeQL and Code
+  Quality. A8's per-slot memory caps stop one job from taking the whole distro down.
 
 Out of scope: GitHub Code Security for the private repos (paid licence, Asher's call), Vercel's
 "Deployment was blocked" on staffing (Asher: no), NFC's `build-mac.yml` (runs on `macos-14`).
@@ -56,14 +62,15 @@ still reach the Windows host and the LAN over the network.
       into each distro, with no cloud copy, then is deleted from Downloads.
       Done when: `gh api /orgs/Thirdline-LLC/installations --jq '.installations[].app_slug'` lists
       it, and `stat -c '%U %a' /etc/thirdline-runners/app.pem` prints `root 600` in both distros.
-- [ ] **A2. Runner groups.** Groups and repo access:
+- [x] **A2. Runner groups.** Groups and repo access:
       `thirdline-pool` (exists) → all repos (CodeQL and Code Quality use it);
       `tapin` (new) → NFC-Attendance-Scanner only;
       `queue` (new) → NFC, build-team, cclp, scholars.
       Labels stay as they are (`thirdline-pool`, `tapin`, `thirdline-queue`), so no workflow changes.
       Done when: `gh api /orgs/Thirdline-LLC/actions/runner-groups` lists all three, and each
       group's `/repositories` matches the list above. (The pickup test needs JIT runners, so it is
-      in A5c.)
+      in A5c.) **Done 2026-11-18:** `tapin` (id 4) → NFC; `queue` (id 5) → NFC, build-team, cclp,
+      scholars; `thirdline-pool` (id 3) → all.
 - [ ] **A3. Runner image** `runners/Dockerfile`, from `ghcr.io/actions/actions-runner` pinned by
       digest, adding Node 20 and 22, gh, jq, PostgreSQL 16 (with `/usr/lib/postgresql/16/bin` on
       PATH), Playwright's system libraries and `runners/pg-start.sh` (see A6). Built locally in each
@@ -107,7 +114,9 @@ still reach the Windows host and the LAN over the network.
       `DATABASE_URL`. Each workflow creates what it needs: `cclp_supply_test` for cclp, user
       `cipguser` and database `cipgdb` for scholars. The same PR per repo also does A7's cache
       check, so each CI file changes once.
-      Done when: `test` (cclp) and `be` (scholars) pass both on today's pool runners (the PR's own
+      In progress: scholars #162 (`fe` passed on the pool with `pg-start.sh`: 1,605 tests) and
+      cclp #9, both queued.
+      Done when: `test` (cclp) and `fe` (scholars) pass both on today's pool runners (the PR's own
       checks) and on the test slot (a branch that points `runs-on` at `thirdline-test`), before
       anything switches.
 - [ ] **A7. Caches at GitHub.** Containers start empty, so npm packages and Playwright browsers come
