@@ -71,7 +71,7 @@ still reach the Windows host and the LAN over the network.
       group's `/repositories` matches the list above. (The pickup test needs JIT runners, so it is
       in A5c.) **Done 2026-11-18:** `tapin` (id 4) → NFC; `queue` (id 5) → NFC, build-team, cclp,
       scholars; `thirdline-pool` (id 3) → all.
-- [ ] **A3. Runner image** `runners/Dockerfile`, from `ghcr.io/actions/actions-runner` pinned by
+- [x] **A3. Runner image** `runners/Dockerfile`, from `ghcr.io/actions/actions-runner` pinned by
       digest, adding Node 20 and 22, gh, jq, PostgreSQL 16 (with `/usr/lib/postgresql/16/bin` on
       PATH), Playwright's system libraries and `runners/pg-start.sh` (see A6). Built locally in each
       distro; never pushed anywhere. Runner self-update is off (`--disableupdate`), so the image
@@ -79,7 +79,11 @@ still reach the Windows host and the LAN over the network.
       Done when, inside a container from the image: `node -v`, `gh --version` (2.104 or later,
       which prints a dispatched run's URL; Plan B needs that), Playwright launches
       Chromium and opens `about:blank`, and `pg-start.sh` brings up Postgres and `psql -c 'select 1'`
-      answers.
+      answers. **Done 2026-11-18** (`runners/test-image.sh`, in a container with the slot limits):
+      Node 20.20.2 / 22.23.4 / 24.22.2 pre-installed, gh 2.103.3, `select 1` answered, Chromium 156
+      opened `about:blank` with `chromiumSandbox: false`. Image 3.7 GB, built in `thirdline-pool`.
+      Everything is pinned (base by digest, Node and gh by checksum); gh comes from its release,
+      because its apt repo keeps only the newest version.
 - [ ] **A4. Docker in `tapin-ci`** from Docker's apt repo, as in `thirdline-pool`.
       Done when: `docker run --rm hello-world` works there.
 - [ ] **A5a. Token script** `runners/jit-config.sh <slot>`: JWT (with `iat` 60 s in the past, to
