@@ -210,6 +210,22 @@ B work runs on today's runners and doesn't wait for Plan A. The scratch repo
       by commit SHA with the version in a comment, like v1.1.0 today; the tag is never moved.
       Done when: actionlint and zizmor are clean, and a different worker than the author installs
       the queue on a fresh scratch branch by following only the README.
+  **B3 built and checked 2026-11-18; the `v2.0.0` tag waits for PR #5 to merge.** `queue/v2` at
+  `d1d3eda` (shared workflows last changed in `d079bbd`). actionlint clean apart from the old
+  SC2016 info on the GraphQL queries; zizmor clean on the shared workflows; the template's only
+  zizmor finding is `@v2.0.0` itself, which install step 1 replaces with a SHA.
+  README-only install: a Haiku builder installed v2 on scratch branch `b3-readme` from the README
+  and templates alone (scratch PR #12). Its install matched ours (only comments, the default
+  timeout and an extra `post_merge`). Through it, scratch PR #13 merged (CI ran on
+  `merge-queue/test-13-…`, `post_merge` ran on `trunk`) and PR #2 was rejected with its reason.
+  Five README gaps it found are fixed in `99ff195`.
+  Found and fixed on the way: `wait` died on GitHub's brief 404 for a run it had just created
+  (`read` on empty input under `set -e`), leaving no result, so the PR got the generic comment;
+  reads now retry and an ERR trap always gives a reason (stub-gh harness: pass, fail, no
+  `workflow_dispatch`, outage, crash). The same crash in B1's first t5 run left a cache on a
+  deleted test ref; `prepare` now sweeps caches by ref pattern, and the next run deleted it.
+  Merged `main` in (#3's read-only caching kept as the second guard, in v2 terms).
+  Left for after merge: tag `v2.0.0` on the merge commit, then pin consumers to that commit in B4.
 - [ ] **B4. Move the repos**, one PR each through its own queue: NFC, build-team, cclp, scholars.
       Not while Plan A's A6/A7 PR for the same repo is open: one CI-file PR per repo at a time.
       Done when: each repo's next queued PR merges through v2, and its log shows CI ran on
