@@ -36,8 +36,7 @@ on:
       runs_on:
         description: >-
           Runner for this job, as JSON: '"ubuntu-latest"' or '["self-hosted","my-label"]'.
-          Empty means ubuntu-latest. The runner must be Linux with jq and gh 2.104 or later
-          (older gh doesn't print the run it started).
+          Empty means ubuntu-latest. The runner must be Linux with gh and jq.
         type: string
         required: false
         default: ''
@@ -97,11 +96,14 @@ jobs:
           started=$(date -u -d '-2 min' +%Y-%m-%dT%H:%M:%SZ)
           for wf in $CI_WORKFLOWS; do
             [[ "$wf" =~ ^[A-Za-z0-9._-]+\.ya?ml$ ]] || fail "Not a workflow file name: '$wf'."
-            if ! out=$(gh workflow run "$wf" -R "$REPO" --ref "$TEST_BRANCH" 2>&1); then
+            # return_run_details makes GitHub answer with the run it created, so there is no
+            # guessing which run is ours (works with any gh version).
+            if ! out=$(gh api -X POST "repos/$REPO/actions/workflows/$wf/dispatches" \
+                -f ref="$TEST_BRANCH" -F return_run_details=true 2>&1); then
               fail "Couldn't start $wf on $TEST_BRANCH: $out (does $wf have a workflow_dispatch trigger?)"
             fi
-            id=$(grep -oE '/actions/runs/[0-9]+' <<< "$out" | head -n 1 | cut -d/ -f4 || true)
-            [ -n "$id" ] || fail "gh didn't print the run it started for $wf ($(gh --version | head -n 1)). The queue needs gh 2.104 or later on its runner."
+            id=$(jq -r '.workflow_run_id // empty' <<< "$out" 2>/dev/null || true)
+            [[ "$id" =~ ^[0-9]+$ ]] || fail "GitHub didn't say which run it started for $wf: $out"
             # Only accept the run if it is exactly what we started: a workflow_dispatch of this
             # file, on this branch and commit, created after this step began.
             run=$(gh api "repos/$REPO/actions/runs/$id")
