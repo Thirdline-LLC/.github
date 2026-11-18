@@ -426,9 +426,18 @@ jobs:
           CLEANUP_OUTCOME: ${{ steps.cleanup.outcome }}
         run: |
           set -euo pipefail
-          # Delete the temporary test branch prepare may have made for this run.
-          gh api -X DELETE "repos/$REPO/git/refs/heads/merge-queue/test-$PR-$GITHUB_RUN_ID" > /dev/null 2>&1 \
-            && echo "Deleted merge-queue/test-$PR-$GITHUB_RUN_ID." || true
+          # Delete the temporary test branch prepare made for this run, and the caches the PR's CI
+          # saved on it first: deleting a branch doesn't delete its caches, and they'd count
+          # against the repo's cache space (and could push out the default branch's).
+          test_branch="merge-queue/test-$PR-$GITHUB_RUN_ID"
+          test_ref_enc=$(jq -rn --arg s "refs/heads/$test_branch" '$s|@uri')
+          for id in $(gh api --paginate "repos/$REPO/actions/caches?ref=$test_ref_enc&per_page=100" \
+              --jq '.actions_caches[].id' 2>/dev/null || true); do
+            gh api -X DELETE "repos/$REPO/actions/caches/$id" > /dev/null 2>&1 \
+              && echo "Deleted cache $id from $test_branch." || echo "::warning::Couldn't delete cache $id."
+          done
+          gh api -X DELETE "repos/$REPO/git/refs/heads/$test_branch" > /dev/null 2>&1 \
+            && echo "Deleted $test_branch." || true
           base_branch=$(gh api "repos/$REPO" --jq .default_branch)
           queue_workflow=${CALLER_WORKFLOW_REF%@*}
           queue_workflow=${queue_workflow##*/}
