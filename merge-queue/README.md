@@ -125,8 +125,10 @@ Do the file changes in a branch and a PR like any other change.
      `gh api repos/Thirdline-LLC/.github/commits/v2.0.0 --jq .sha`, then write each `uses:` as
      `Thirdline-LLC/.github/.github/workflows/merge-queue-prepare.yml@<sha> # v2.0.0`.
    - In `merge-queue.yml`, set `ci_workflows` (in the `wait` job) to every CI workflow file
-     that produces a required check, space-separated.
-   - Set `post_merge` to the workflows that run on push to `main`.
+     that produces a required check, space-separated. If nothing is required yet, list the CI
+     files you want a PR to pass before it merges.
+   - Set `post_merge` to the workflows that run on push to `main`. They need a
+     `workflow_dispatch` trigger too, because finish starts them that way.
 2. **Give each of those CI workflows a `workflow_dispatch` trigger.** Keep every trigger it
    already has. That is the only change it needs: wait starts it on the test branch, where
    `actions/checkout` with no `ref` already checks out the test merge. Things to know:
@@ -142,12 +144,17 @@ Do the file changes in a branch and a PR like any other change.
      usually `contents: read`.
    - Don't rename jobs. Required check names must still match on normal PR runs.
    - A CI workflow that is also a reusable workflow (`workflow_call` with an input `ref`, from
-     v1) still works; the input is just empty. Remove it once no v1 caller is left.
+     v1) still works; the input is just empty. Remove it once no v1 caller is left. A file
+     without `workflow_call` must not mention `inputs.ref` at all (actionlint rejects it):
+     write `checks-${{ inputs.ref || github.ref }}` as `checks-${{ github.ref }}`.
 3. **Settings** (a repo admin does these):
    - Label: `gh label create merge-queue --color 0E8A16 --description "Queued to merge after testing against the latest main"`.
+     If the label already exists, keep it; only the name matters.
    - Branch protection on `main`: add `merge-queue` to the required checks, pinned to the GitHub
      Actions app (app id 15368) like the others. Keep "Require branches to be up to date" off
-     (`strict: false`).
+     (`strict: false`). If `main` has no protection yet, add it (or a ruleset with a required
+     status check) with `merge-queue` as its only required check. Without it the queue still
+     works, but nothing stops a merge that skips it.
    - If a ruleset limits who can create branches, let GitHub Actions create `merge-queue/test-*`.
 4. **Check it with a test PR.** Queue a one-line PR. You should see `merge-queue-kick`, then
    `merge-queue`, then "Queued: ..." and "Merged as ..." on the PR, and main's push workflows
