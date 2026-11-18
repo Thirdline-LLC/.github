@@ -89,6 +89,9 @@ jobs:
             printf 'reason=%s\n' "$(tr '\r\n' '  ' <<< "$1" | cut -c1-300)" >> "$GITHUB_OUTPUT"
             exit 0
           }
+          # A command that fails where nothing checks it would end the job with no result and no
+          # reason. Turn that into an ordinary failure that says where it happened.
+          trap 'fail "The queue hit an unexpected error while running CI (merge-queue-wait line $LINENO)."' ERR
 
           [[ "$TEST_BRANCH" =~ ^merge-queue/test-[0-9]+-[0-9]+$ ]] || fail "Not a queue test branch: '$TEST_BRANCH'."
           [[ "$TEST_REF" =~ ^[0-9a-f]{40}$ ]] || fail "Not a commit SHA: '$TEST_REF'."
@@ -105,14 +108,23 @@ jobs:
             # return_run_details makes GitHub answer with the run it created, so there is no
             # guessing which run is ours (works with any gh version).
             if ! out=$(gh api -X POST "repos/$REPO/actions/workflows/$wf/dispatches" \
-                -f ref="$TEST_BRANCH" -F return_run_details=true 2>&1); then
-              fail "Couldn't start $wf on $TEST_BRANCH: $out (does $wf have a workflow_dispatch trigger?)"
+                -f ref="$TEST_BRANCH" -F return_run_details=true 2> "$RUNNER_TEMP/dispatch-err"); then
+              msg=$(jq -r '.message // empty' <<< "$out" 2>/dev/null || true)
+              msg=${msg:-$(head -c 200 "$RUNNER_TEMP/dispatch-err")}
+              hint=""; [[ "$msg" == *workflow_dispatch* ]] || hint=" Check that it has a workflow_dispatch trigger."
+              fail "Couldn't start $wf: $msg.$hint"
             fi
             id=$(jq -r '.workflow_run_id // empty' <<< "$out" 2>/dev/null || true)
             [[ "$id" =~ ^[0-9]+$ ]] || fail "GitHub didn't say which run it started for $wf: $out"
             # Only accept the run if it is exactly what we started: a workflow_dispatch of this
             # file, on this branch and commit, created after this step began.
-            run=$(gh api "repos/$REPO/actions/runs/$id")
+            # GitHub can answer 404 for a run it created a moment ago, so try a few times.
+            run=""
+            for _ in 1 2 3 4 5; do
+              run=$(gh api "repos/$REPO/actions/runs/$id" 2>/dev/null) && break
+              run=""; sleep 3
+            done
+            [ -n "$run" ] || fail "GitHub started run $id for $wf but wouldn't show it."
             ok=$(jq -r --arg b "$TEST_BRANCH" --arg s "$TEST_REF" --arg w "$wf" --arg t "$started" '
               .event == "workflow_dispatch" and .head_branch == $b and .head_sha == $s
               and (.path | endswith("/" + $w)) and .created_at >= $t' <<< "$run")
@@ -122,11 +134,15 @@ jobs:
           done
 
           deadline=$(( $(date +%s) + TIMEOUT_MINUTES * 60 ))
+          misses=0
           while :; do
-            pending=0; failed=""
+            pending=0; failed=""; missed=0
             while read -r id wf; do
-              read -r status conclusion < <(gh api "repos/$REPO/actions/runs/$id" \
-                --jq '"\(.status) \(.conclusion // "-")"' < /dev/null)
+              if ! info=$(gh api "repos/$REPO/actions/runs/$id" \
+                  --jq '"\(.status) \(.conclusion // "-")"' < /dev/null 2>/dev/null); then
+                missed=1; pending=$((pending + 1)); continue
+              fi
+              read -r status conclusion <<< "$info"
               if [ "$status" != completed ]; then
                 pending=$((pending + 1))
               elif [ "$conclusion" != success ]; then
@@ -134,6 +150,9 @@ jobs:
               fi
             done < "$ids_file"
             [ -z "$failed" ] || fail "CI failed on the test merge: $failed."
+            # About two minutes of GitHub not answering is an outage, not a slow CI run.
+            if [ "$missed" = 1 ]; then misses=$((misses + 1)); else misses=0; fi
+            [ "$misses" -lt 6 ] || fail "Couldn't read the CI runs' status from GitHub for about two minutes."
             if [ "$pending" = 0 ]; then
               echo "All CI runs passed on $TEST_REF."
               echo "Merge queue CI: **success** on \`${TEST_REF:0:7}\`." >> "$GITHUB_STEP_SUMMARY"
