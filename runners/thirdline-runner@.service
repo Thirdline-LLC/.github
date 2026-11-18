@@ -1,0 +1,18 @@
+# One single-use runner slot (docs/progress.md, A5b). Install to /etc/systemd/system/, then:
+#   systemctl enable --now thirdline-runner@<slot>
+[Unit]
+Description=Thirdline single-use runner slot %i
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/opt/thirdline-runners/supervise.sh %i
+# The container is named tr-<slot>; never leave one behind when the slot stops.
+ExecStopPost=/usr/bin/docker rm -f tr-%i
+Restart=always
+RestartSec=15
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
