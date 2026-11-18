@@ -1,0 +1,175 @@
+name: merge-queue-wait
+# Shared merge queue, between prepare and finish (v2). Runs this repo's CI on the temporary test
+# branch prepare made, and waits for the result.
+#
+# Why a separate run instead of calling CI as a reusable workflow: a called workflow runs inside
+# the queue's run on the default branch, so the PR's code could save caches that later runs on
+# the default branch restore. A run started on the test branch has that branch's cache scope: it
+# can read the default branch's caches, and what it writes stays on the test branch, which finish
+# deletes together with its caches.
+#
+# Every doubt is a failure: no run started, a run that doesn't match the test commit, a timeout,
+# or anything other than a clean success rejects the PR.
+
+on:
+  workflow_call:
+    inputs:
+      test_branch:
+        description: Branch prepare made at test_ref (prepare's test_branch output).
+        type: string
+        required: true
+      test_ref:
+        description: Commit under test (prepare's test_ref output).
+        type: string
+        required: true
+      ci_workflows:
+        description: >-
+          Space-separated CI workflow files to run on the test branch, for example
+          'ci.yml' or 'checks.yml verify.yml'. Each needs a workflow_dispatch trigger.
+        type: string
+        required: true
+      timeout_minutes:
+        description: How long to wait for all CI runs together, at most 50.
+        type: number
+        required: false
+        default: 45
+      runs_on:
+        description: >-
+          Runner for this job, as JSON: '"ubuntu-latest"' or '["self-hosted","my-label"]'.
+          Empty means ubuntu-latest. The runner must be Linux with gh and jq.
+        type: string
+        required: false
+        default: ''
+    outputs:
+      result:
+        description: success, or failure with the reason in the run summary.
+        value: ${{ jobs.wait.outputs.result }}
+      reason:
+        description: On failure, one line saying why (pass it to finish as test_reason).
+        value: ${{ jobs.wait.outputs.reason }}
+
+jobs:
+  wait:
+    name: merge-queue-wait
+    runs-on: ${{ fromJSON(inputs.runs_on || '"ubuntu-latest"') }}
+    # timeout_minutes (at most 50) plus room for starting and checking runs.
+    timeout-minutes: 60
+    permissions:
+      actions: write        # start CI on the test branch, cancel it if this run is cancelled
+      contents: read
+    outputs:
+      result: ${{ steps.run.outputs.result }}
+      reason: ${{ steps.run.outputs.reason }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      TEST_BRANCH: ${{ inputs.test_branch }}
+      TEST_REF: ${{ inputs.test_ref }}
+      CI_WORKFLOWS: ${{ inputs.ci_workflows }}
+      TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+    steps:
+      - name: Run CI on the test branch and wait
+        id: run
+        shell: bash
+        run: |
+          set -euo pipefail
+          ids_file="$RUNNER_TEMP/merge-queue-ci-runs"
+          : > "$ids_file"
+          cancel_started() {
+            while read -r id _; do
+              gh run cancel "$id" -R "$REPO" > /dev/null 2>&1 && echo "Cancelled run $id." || true
+            done < "$ids_file"
+          }
+          fail() {
+            echo "::error::$1"
+            cancel_started
+            echo "Merge queue CI: **failure**. $1" >> "$GITHUB_STEP_SUMMARY"
+            echo "result=failure" >> "$GITHUB_OUTPUT"
+            # One line for finish's PR comment; finish cleans it again before posting.
+            printf 'reason=%s\n' "$(tr '\r\n' '  ' <<< "$1" | cut -c1-300)" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          # A command that fails where nothing checks it would end the job with no result and no
+          # reason. Turn that into an ordinary failure that says where it happened.
+          trap 'fail "The queue hit an unexpected error while running CI (merge-queue-wait line $LINENO)."' ERR
+
+          [[ "$TEST_BRANCH" =~ ^merge-queue/test-[0-9]+-[0-9]+$ ]] || fail "Not a queue test branch: '$TEST_BRANCH'."
+          [[ "$TEST_REF" =~ ^[0-9a-f]{40}$ ]] || fail "Not a commit SHA: '$TEST_REF'."
+          [ -n "${CI_WORKFLOWS// /}" ] || fail "No CI workflows named (ci_workflows)."
+          branch_sha=$(gh api "repos/$REPO/git/ref/heads/$TEST_BRANCH" --jq .object.sha 2>/dev/null || true)
+          [ "$branch_sha" = "$TEST_REF" ] || fail "$TEST_BRANCH is at '${branch_sha:-nothing}', not $TEST_REF."
+
+          [[ "$TIMEOUT_MINUTES" =~ ^[0-9]+$ ]] && [ "$TIMEOUT_MINUTES" -le 50 ] \
+            || fail "timeout_minutes must be a whole number up to 50, not '$TIMEOUT_MINUTES'."
+          # Two minutes of slack, in case this runner's clock is a little ahead of GitHub's.
+          started=$(date -u -d '-2 min' +%Y-%m-%dT%H:%M:%SZ)
+          for wf in $CI_WORKFLOWS; do
+            [[ "$wf" =~ ^[A-Za-z0-9._-]+\.ya?ml$ ]] || fail "Not a workflow file name: '$wf'."
+            # return_run_details makes GitHub answer with the run it created, so there is no
+            # guessing which run is ours (works with any gh version).
+            if ! out=$(gh api -X POST "repos/$REPO/actions/workflows/$wf/dispatches" \
+                -f ref="$TEST_BRANCH" -F return_run_details=true 2> "$RUNNER_TEMP/dispatch-err"); then
+              msg=$(jq -r '.message // empty' <<< "$out" 2>/dev/null || true)
+              msg=${msg:-$(head -c 200 "$RUNNER_TEMP/dispatch-err")}
+              hint=""; [[ "$msg" == *workflow_dispatch* ]] || hint=" Check that it has a workflow_dispatch trigger."
+              fail "Couldn't start $wf: $msg.$hint"
+            fi
+            id=$(jq -r '.workflow_run_id // empty' <<< "$out" 2>/dev/null || true)
+            [[ "$id" =~ ^[0-9]+$ ]] || fail "GitHub didn't say which run it started for $wf: $out"
+            # Only accept the run if it is exactly what we started: a workflow_dispatch of this
+            # file, on this branch and commit, created after this step began.
+            # GitHub can answer 404 for a run it created a moment ago, so try a few times.
+            run=""
+            for _ in 1 2 3 4 5; do
+              run=$(gh api "repos/$REPO/actions/runs/$id" 2>/dev/null) && break
+              run=""; sleep 3
+            done
+            [ -n "$run" ] || fail "GitHub started run $id for $wf but wouldn't show it."
+            ok=$(jq -r --arg b "$TEST_BRANCH" --arg s "$TEST_REF" --arg w "$wf" --arg t "$started" '
+              .event == "workflow_dispatch" and .head_branch == $b and .head_sha == $s
+              and (.path | endswith("/" + $w)) and .created_at >= $t' <<< "$run")
+            [ "$ok" = true ] || fail "Run $id doesn't match the test (event, branch, commit, file or time): $(jq -c '{event,head_branch,head_sha,path,created_at}' <<< "$run")"
+            echo "$id $wf" >> "$ids_file"
+            echo "Started $wf: $GITHUB_SERVER_URL/$REPO/actions/runs/$id"
+          done
+
+          deadline=$(( $(date +%s) + TIMEOUT_MINUTES * 60 ))
+          misses=0
+          while :; do
+            pending=0; failed=""; missed=0
+            while read -r id wf; do
+              if ! info=$(gh api "repos/$REPO/actions/runs/$id" \
+                  --jq '"\(.status) \(.conclusion // "-")"' < /dev/null 2>/dev/null); then
+                missed=1; pending=$((pending + 1)); continue
+              fi
+              read -r status conclusion <<< "$info"
+              if [ "$status" != completed ]; then
+                pending=$((pending + 1))
+              elif [ "$conclusion" != success ]; then
+                failed="${failed:+$failed, }$wf ($conclusion)"
+              fi
+            done < "$ids_file"
+            [ -z "$failed" ] || fail "CI failed on the test merge: $failed."
+            # About two minutes of GitHub not answering is an outage, not a slow CI run.
+            if [ "$missed" = 1 ]; then misses=$((misses + 1)); else misses=0; fi
+            [ "$misses" -lt 6 ] || fail "Couldn't read the CI runs' status from GitHub for about two minutes."
+            if [ "$pending" = 0 ]; then
+              echo "All CI runs passed on $TEST_REF."
+              echo "Merge queue CI: **success** on \`${TEST_REF:0:7}\`." >> "$GITHUB_STEP_SUMMARY"
+              echo "result=success" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            [ "$(date +%s)" -lt "$deadline" ] || fail "CI didn't finish within $TIMEOUT_MINUTES minutes."
+            sleep 20
+          done
+
+      # A cancelled or timed-out queue run must not leave CI running and holding runners.
+      - name: Cancel CI runs this job started
+        if: cancelled() || failure()
+        shell: bash
+        run: |
+          ids_file="$RUNNER_TEMP/merge-queue-ci-runs"
+          [ -s "$ids_file" ] || exit 0
+          while read -r id _; do
+            gh run cancel "$id" -R "$REPO" > /dev/null 2>&1 && echo "Cancelled run $id." || true
+          done < "$ids_file"

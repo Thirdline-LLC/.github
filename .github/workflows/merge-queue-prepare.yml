@@ -35,6 +35,11 @@ on:
       test_ref:
         description: SHA of GitHub's test merge commit (latest base + PR head).
         value: ${{ jobs.prepare.outputs.test_ref }}
+      test_branch:
+        description: >-
+          Temporary branch at test_ref (merge-queue/test-<pr>-<run>) when state is test. CI runs
+          there, in that branch's cache scope instead of the default branch's. finish deletes it.
+        value: ${{ jobs.prepare.outputs.test_branch }}
       state:
         description: none, ready, test, conflict, invalid or cancelled.
         value: ${{ jobs.prepare.outputs.state }}
@@ -56,6 +61,7 @@ jobs:
       head_sha: ${{ steps.out.outputs.head_sha }}
       base_sha: ${{ steps.out.outputs.base_sha }}
       test_ref: ${{ steps.out.outputs.test_ref }}
+      test_branch: ${{ steps.out.outputs.test_branch }}
       state: ${{ steps.out.outputs.state }}
     env:
       GH_TOKEN: ${{ github.token }}
@@ -87,6 +93,22 @@ jobs:
             fi
             gh api "repos/$REPO/issues/$pr/comments" -f body="$body
           $marker" > /dev/null
+          }
+
+          # Every PR the queue tests gets its own branch at the commit under test, so its CI runs in
+          # the cache scope of that branch, not of the default branch. Same name pattern as the
+          # test merges below, so the sweep at the start of a run and the delete in finish find it.
+          ensure_test_branch() {
+            local sha=$1
+            test_branch="merge-queue/test-$pr-$GITHUB_RUN_ID"
+            if ! gh api "repos/$REPO/git/ref/heads/$test_branch" > /dev/null 2>&1; then
+              gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$test_branch" -f sha="$sha" > /dev/null
+            fi
+            if [ "$(gh api "repos/$REPO/git/ref/heads/$test_branch" --jq .object.sha)" != "$sha" ]; then
+              echo "::warning::$test_branch is not at $sha."
+              return 1
+            fi
+            result test_branch "$test_branch"
           }
 
           # Required checks on the default branch (classic protection + rulesets), minus our own.
@@ -146,7 +168,14 @@ jobs:
           owner=${REPO%%/*}
           name=${REPO#*/}
 
-          # Runs are one at a time, so any temporary test branch left now is from an old run.
+          # Runs are one at a time, so any temporary test branch, or cache on one, left now is from
+          # an old run. Caches go by ref, not by branch: a CI run still finishing after finish
+          # deleted its branch can save a cache on a ref that no longer exists.
+          for id in $(gh api --paginate "repos/$REPO/actions/caches?per_page=100" \
+              --jq '.actions_caches[] | select(.ref | test("^refs/heads/merge-queue/test-[0-9]+-[0-9]+$")) | .id' \
+              2>/dev/null || true); do
+            gh api -X DELETE "repos/$REPO/actions/caches/$id" > /dev/null 2>&1 && echo "Deleted old test cache $id." || true
+          done
           for ref in $(gh api --paginate "repos/$REPO/git/matching-refs/heads/merge-queue/test-" --jq '.[].ref'); do
             [[ "$ref" =~ ^refs/heads/merge-queue/test-[0-9]+-[0-9]+$ ]] || continue
             gh api -X DELETE "repos/$REPO/git/$ref" > /dev/null && echo "Deleted old ${ref#refs/heads/}."
@@ -250,6 +279,7 @@ jobs:
               exit 0
             fi
             echo "No required checks found, so the queue runs CI on the PR head."
+            if ! ensure_test_branch "$head_sha"; then result state invalid; exit 0; fi
             result state test
             comment_once "prepare:$head_sha:$base_sha" \
               "Queued: testing against $base_branch \`${base_sha:0:7}\`. [Run]($run_url)"
@@ -310,6 +340,7 @@ jobs:
             result state invalid
             exit 0
           fi
+          if ! ensure_test_branch "$test_ref"; then result state invalid; exit 0; fi
           result test_ref "$test_ref"
           result state test
           comment_once "prepare:$head_sha:$base_sha" \
@@ -341,6 +372,7 @@ jobs:
             echo "head_sha=$(get head_sha)"
             echo "base_sha=$(get base_sha)"
             echo "test_ref=$(get test_ref)"
+            echo "test_branch=$(get test_branch)"
             echo "state=${state:-invalid}"
           } | tee -a "$GITHUB_OUTPUT"
           {

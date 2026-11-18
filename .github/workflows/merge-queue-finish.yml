@@ -28,6 +28,11 @@ on:
         type: string
         required: false
         default: failure
+      test_reason:
+        description: Why the test failed (merge-queue-wait's reason output), for the PR comment.
+        type: string
+        required: false
+        default: ''
       post_merge:
         description: Space-separated workflow files to start on the default branch after a merge.
         type: string
@@ -71,6 +76,7 @@ jobs:
       BASE_SHA: ${{ inputs.base_sha }}
       STATE: ${{ inputs.state }}
       TEST_RESULT: ${{ inputs.test_result }}
+      TEST_REASON: ${{ inputs.test_reason }}
       POST_MERGE: ${{ inputs.post_merge }}
       LABEL: ${{ inputs.label }}
       STATUS_CONTEXT: ${{ inputs.status_context }}
@@ -281,6 +287,11 @@ jobs:
             # A real failure can cancel sibling jobs (fail-fast), so it wins over "cancelled".
             if grep -q '=cancelled$' <<< "$jobs" && ! grep -q '=failure$' <<< "$jobs"; then
               reject cancelled "Testing was cancelled, so the queue didn't merge this PR. Add the \`$LABEL\` label again to retry."
+            elif [ -n "$TEST_REASON" ]; then
+              # The reason can quote CI job names and API errors: keep it to one line of plain text
+              # that can't break the comment's Markdown or @-mention anyone.
+              why=$(tr -d '`@\r' <<< "$TEST_REASON" | tr '\n' ' ' | sed 's/  */ /g; s/ $//' | cut -c1-300)
+              reject tests "Testing against $base_branch \`${BASE_SHA:0:7}\` didn't pass: $why Fix it, then add the \`$LABEL\` label again."
             else
               reject tests "Tests failed against $base_branch \`${BASE_SHA:0:7}\`. Fix them, then add the \`$LABEL\` label again."
             fi
@@ -426,9 +437,18 @@ jobs:
           CLEANUP_OUTCOME: ${{ steps.cleanup.outcome }}
         run: |
           set -euo pipefail
-          # Delete the temporary test branch prepare may have made for this run.
-          gh api -X DELETE "repos/$REPO/git/refs/heads/merge-queue/test-$PR-$GITHUB_RUN_ID" > /dev/null 2>&1 \
-            && echo "Deleted merge-queue/test-$PR-$GITHUB_RUN_ID." || true
+          # Delete the temporary test branch prepare made for this run, and the caches the PR's CI
+          # saved on it first: deleting a branch doesn't delete its caches, and they'd count
+          # against the repo's cache space (and could push out the default branch's).
+          test_branch="merge-queue/test-$PR-$GITHUB_RUN_ID"
+          test_ref_enc=$(jq -rn --arg s "refs/heads/$test_branch" '$s|@uri')
+          for id in $(gh api --paginate "repos/$REPO/actions/caches?ref=$test_ref_enc&per_page=100" \
+              --jq '.actions_caches[].id' 2>/dev/null || true); do
+            gh api -X DELETE "repos/$REPO/actions/caches/$id" > /dev/null 2>&1 \
+              && echo "Deleted cache $id from $test_branch." || echo "::warning::Couldn't delete cache $id."
+          done
+          gh api -X DELETE "repos/$REPO/git/refs/heads/$test_branch" > /dev/null 2>&1 \
+            && echo "Deleted $test_branch." || true
           base_branch=$(gh api "repos/$REPO" --jq .default_branch)
           queue_workflow=${CALLER_WORKFLOW_REF%@*}
           queue_workflow=${queue_workflow##*/}
