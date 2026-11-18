@@ -28,7 +28,7 @@ What the queue's comments mean:
 | Queued: testing against main `abc1234`. | Tests run on the PR merged into that `main`. |
 | Already up to date with main and checks passed. It will merge if nothing changes. | Nothing to re-test. |
 | Merged as `abc1234`. | Done. The label is gone. Main's push workflows were started. |
-| Tests failed against main `abc1234`. | The PR breaks on the latest `main`. The label is gone. Fix it and queue it again. |
+| Testing against main `abc1234` didn't pass: (reason) | The reason says what: CI failed (with the job names), CI didn't finish in time, or the CI file couldn't be started (it needs `workflow_dispatch`). The label is gone. Fix it and queue it again. |
 | Testing was cancelled. / The queue run was cancelled. | Someone cancelled the run. The label is gone. Queue it again. |
 | The queue hit an error with this PR. | Something broke in the queue itself. The label is gone. Queue it again. |
 | The label was removed, so the queue stopped. | Someone took it out of the queue mid-test. |
@@ -41,7 +41,7 @@ What the queue's comments mean:
 ## How it works
 
 Each repo has two small workflows. The shared logic lives here, in
-`.github/workflows/merge-queue-prepare.yml` and `.github/workflows/merge-queue-finish.yml`.
+`.github/workflows/merge-queue-prepare.yml`, `merge-queue-wait.yml` and `merge-queue-finish.yml`.
 
 1. `merge-queue-kick.yml` runs when a PR gets the label. It starts `merge-queue.yml` on `main`.
    It checks out nothing.
@@ -53,7 +53,13 @@ Each repo has two small workflows. The shared logic lives here, in
        as `test_ref`. State `test`.
      - Doesn't merge cleanly: `conflict`. Draft, closed, wrong base, from a fork, or its own
        checks already failed: `invalid`.
-   - **This repo's CI** runs as reusable workflows on `test_ref`.
+     - For state `test` it pushes the branch `merge-queue/test-<pr>-<run>` at `test_ref` and
+       outputs it as `test_branch`.
+   - **wait** starts each of this repo's CI files on `test_branch` (`workflow_dispatch`), checks
+     that GitHub started exactly that run (event, branch, commit, file, time), and waits for all
+     of them. If the queue run is cancelled, it cancels the CI runs it started.
+     Because CI runs on its own branch, its caches are that branch's, not `main`'s: a PR can't put
+     anything in a cache that `main` later restores.
    - **finish** merges or rejects. Before merging it waits for the PR's own required checks,
      checks that neither `main` nor the PR moved, sets the commit status `merge-queue` to success
      on the PR head, and squash-merges with the head pinned. It then starts the `post_merge`
@@ -76,7 +82,8 @@ merge made with the workflow token. So after the queue merges one PR, the others
 stale. prepare uses GitHub's test merge only when its parents are exactly the latest `main` and
 the PR head. Otherwise it makes its own: it creates the branch `merge-queue/test-<pr>-<run>` at
 `main` and merges the PR head into it with the merges API, then checks the new commit's
-parents. finish deletes that branch, and the next prepare deletes any that were left behind.
+parents. Either way CI runs on that branch. finish deletes the branch and its caches, and the
+next prepare deletes any that were left behind.
 
 ### prepare outputs
 
@@ -86,17 +93,25 @@ parents. finish deletes that branch, and the next prepare deletes any that were 
 | `head_sha` | PR head SHA when picked |
 | `base_sha` | `main` SHA the test is based on |
 | `test_ref` | SHA to test: the test merge, or the PR head when it is already up to date |
+| `test_branch` | `merge-queue/test-<pr>-<run>`, at `test_ref`, when state is `test` |
 | `state` | `none`, `ready`, `test`, `conflict`, `invalid` or `cancelled` |
 
 Inputs (all optional): `label` (default `merge-queue`), `status_context` (default
 `merge-queue`) and `runs_on` (see "Choosing the runner").
 
+### wait inputs and outputs
+
+`test_branch` and `test_ref` from prepare. `ci_workflows`: the CI files to run, space-separated,
+for example `checks.yml verify.yml`. `timeout_minutes`: how long to wait for all of them
+together (default 45, at most 50). `runs_on` as above. Outputs: `result` (`success` or
+`failure`) and, on failure, `reason` (one line).
+
 ### finish inputs
 
-`pr`, `head_sha`, `base_sha`, `state` and `test_result` (`success` or `failure`) from the
-caller. Only `success` counts as passed: the template turns a failed, cancelled or skipped CI job
-into `failure`. `post_merge`: space-separated workflow files to start on `main` after a merge. `label` and
-`status_context` and `runs_on` as above.
+`pr`, `head_sha`, `base_sha`, `state`, `test_result` (`success` or `failure`) and
+`test_reason` from the caller. Only `success` counts as passed: the template turns a failed,
+cancelled or skipped wait into `failure`. `post_merge`: space-separated workflow files to start
+on `main` after a merge. `label` and `status_context` and `runs_on` as above.
 
 ## Installing it in a repo
 
@@ -105,28 +120,29 @@ Do the file changes in a branch and a PR like any other change.
 1. **Add the two caller files** from [`templates/`](templates/) to `.github/workflows/`. In a
    Thirdline-LLC repo you can also pick them in the Actions tab under "New workflow".
    - Leave `merge-queue-kick.yml` as it is.
-   - In `merge-queue.yml`, add one job per CI workflow file that produces a required check,
-     named after the file, and list each job in `finish.needs`.
-   - Each CI job keeps `permissions: contents: read` from the template, because it runs PR
-     code. It gets no secrets. If that CI needs a secret, pass it by name under `secrets:`.
-     Don't use `secrets: inherit`.
+   - **Pin the three shared workflows to the release commit**, not the tag, and keep the
+     version in a comment. Get the commit with
+     `gh api repos/Thirdline-LLC/.github/commits/v2.0.0 --jq .sha`, then write each `uses:` as
+     `Thirdline-LLC/.github/.github/workflows/merge-queue-prepare.yml@<sha> # v2.0.0`.
+   - In `merge-queue.yml`, set `ci_workflows` (in the `wait` job) to every CI workflow file
+     that produces a required check, space-separated.
    - Set `post_merge` to the workflows that run on push to `main`.
-2. **Change each of those CI workflows**, and each one that runs on push to `main`:
-   - Add a `workflow_call` trigger with a string input `ref` (default `''`), and
-     `workflow_dispatch`. Keep every trigger it already has.
-   - Give every `actions/checkout` step `ref: ${{ inputs.ref }}`. If it already sets `ref`,
-     use `${{ inputs.ref || <old expression> }}`.
-   - **Add a workflow-level `permissions:` block with the least it needs**, usually
-     `contents: read`. With the caller job's `contents: read`, PR code tested by the queue never
-     gets a write token.
-   - In a called run, `github.event_name` is `workflow_dispatch`, `github.event.pull_request` is
-     empty, and `github.ref` and `github.sha` are main's. Steps gated on `pull_request` must also
-     run when `inputs.ref != ''`. A diff against `github.event.pull_request.base.sha` needs a
-     fallback: `HEAD^1` of the test merge is the base.
-   - A `concurrency` group built from `github.ref` or `github.workflow` must include
-     `inputs.ref`, so a queue run never cancels main's runs.
+2. **Give each of those CI workflows a `workflow_dispatch` trigger.** Keep every trigger it
+   already has. That is the only change it needs: wait starts it on the test branch, where
+   `actions/checkout` with no `ref` already checks out the test merge. Things to know:
+   - In a queue run, `github.event_name` is `workflow_dispatch`, `github.event.pull_request` is
+     empty, `github.ref` is `refs/heads/merge-queue/test-<pr>-<run>` and `github.sha` is the
+     test merge. Steps gated on `pull_request` must also run on `workflow_dispatch`. A diff
+     against `github.event.pull_request.base.sha` needs a fallback: `HEAD^1` of the test merge
+     is the base.
+   - A `concurrency` group built from `github.ref` is fine as it is: every test branch is its
+     own group, so a queue run and `main`'s runs never cancel each other.
+   - The run uses the CI file as the PR changed it, with the repo's secrets, like any push to a
+     branch in the repo. Give it a workflow-level `permissions:` block with the least it needs,
+     usually `contents: read`.
    - Don't rename jobs. Required check names must still match on normal PR runs.
-   - Note any secrets it uses. The queue passes none unless you name them in the caller.
+   - A CI workflow that is also a reusable workflow (`workflow_call` with an input `ref`, from
+     v1) still works; the input is just empty. Remove it once no v1 caller is left.
 3. **Settings** (a repo admin does these):
    - Label: `gh label create merge-queue --color 0E8A16 --description "Queued to merge after testing against the latest main"`.
    - Branch protection on `main`: add `merge-queue` to the required checks, pinned to the GitHub
@@ -149,8 +165,8 @@ gh variable set MERGE_QUEUE_RUNS_ON -R OWNER/REPO --body '"my-queue-runner"'   #
 gh variable delete MERGE_QUEUE_RUNS_ON -R OWNER/REPO   # back to ubuntu-latest
 ```
 
-The template passes it to prepare and finish as `runs_on`, and `merge-queue-kick.yml` reads it
-too. A run reads it when it starts. The runner must be Linux (the scripts need bash 4 or later)
+The template passes it to prepare, wait and finish as `runs_on`, and `merge-queue-kick.yml`
+reads it too. CI itself runs wherever its own `runs-on` says, never on the queue runner. A run reads it when it starts. The runner must be Linux (the scripts need bash 4 or later)
 with `gh` and `jq`. If it is offline, queue jobs wait for it (up to a day) and nothing merges:
 start it, or delete the variable.
 
@@ -189,8 +205,10 @@ Actions app and a ruleset that requires PRs:
   runs as that app and can set the status. Review workflow changes with that in mind. A
   dedicated GitHub App token for the queue would close this, and its merges would also fire
   `push` workflows.
-- **CI definitions come from `main`.** The queue runs the CI workflow files on `main`, not the
-  PR's copy. A PR that changes CI is tested with the old CI.
+- **CI definitions come from the PR.** The queue runs the CI files as they are on the test
+  branch, so a PR that changes CI is tested with its new CI, with the repo's secrets. That is no
+  more than a push to any branch in the repo already gets, and the queue takes no forks.
+  Review CI changes with that in mind.
 - **Last-second pushes.** A push to the PR in the second or two before the merge can be left
   out: GitHub merges the tested head and shows the PR as merged. Open a new PR for the extra
   commit.
@@ -215,5 +233,12 @@ Actions app and a ruleset that requires PRs:
 ## Tested
 
 [Thirdline-LLC/merge-queue-sandbox](https://github.com/Thirdline-LLC/merge-queue-sandbox) is the
-test bed. Its PRs show each case: up to date, behind, three at once, two PRs that clash, a real
-conflict, a direct merge refused, workflow file changes, and `main` or the PR moving mid-test.
+test bed for v1. Its PRs show each case: up to date, behind, three at once, two PRs that clash, a
+real conflict, a direct merge refused, workflow file changes, and `main` or the PR moving
+mid-test.
+
+v2 (CI on the test branch) was tested on a scratch repo: a passing PR merged; failing CI, a CI
+file without `workflow_dispatch` and a PR pushed to mid-test were each rejected with the reason;
+cancelling the queue run cancelled its CI run; a queue test, a `main` run and a PR run at once
+didn't cancel each other; no test branches or caches were left. Details in
+[`docs/progress.md`](../docs/progress.md), B1 and B2.

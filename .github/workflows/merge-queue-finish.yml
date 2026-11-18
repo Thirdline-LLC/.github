@@ -28,6 +28,11 @@ on:
         type: string
         required: false
         default: failure
+      test_reason:
+        description: Why the test failed (merge-queue-wait's reason output), for the PR comment.
+        type: string
+        required: false
+        default: ''
       post_merge:
         description: Space-separated workflow files to start on the default branch after a merge.
         type: string
@@ -71,6 +76,7 @@ jobs:
       BASE_SHA: ${{ inputs.base_sha }}
       STATE: ${{ inputs.state }}
       TEST_RESULT: ${{ inputs.test_result }}
+      TEST_REASON: ${{ inputs.test_reason }}
       POST_MERGE: ${{ inputs.post_merge }}
       LABEL: ${{ inputs.label }}
       STATUS_CONTEXT: ${{ inputs.status_context }}
@@ -281,6 +287,11 @@ jobs:
             # A real failure can cancel sibling jobs (fail-fast), so it wins over "cancelled".
             if grep -q '=cancelled$' <<< "$jobs" && ! grep -q '=failure$' <<< "$jobs"; then
               reject cancelled "Testing was cancelled, so the queue didn't merge this PR. Add the \`$LABEL\` label again to retry."
+            elif [ -n "$TEST_REASON" ]; then
+              # The reason can quote CI job names and API errors: keep it to one line of plain text
+              # that can't break the comment's Markdown or @-mention anyone.
+              why=$(tr -d '`@\r' <<< "$TEST_REASON" | tr '\n' ' ' | cut -c1-300)
+              reject tests "Testing against $base_branch \`${BASE_SHA:0:7}\` didn't pass: $why Fix it, then add the \`$LABEL\` label again."
             else
               reject tests "Tests failed against $base_branch \`${BASE_SHA:0:7}\`. Fix them, then add the \`$LABEL\` label again."
             fi

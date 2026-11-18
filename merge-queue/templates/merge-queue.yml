@@ -2,46 +2,56 @@ name: merge-queue
 # Merges queued PRs one at a time after testing each against the latest main.
 # Queue a PR: gh pr edit N --add-label merge-queue
 # How it works: https://github.com/Thirdline-LLC/.github/blob/main/merge-queue/README.md
+# Pin each shared workflow to the v2.0.0 commit, not the tag (README, "Installing it", step 1).
 on:
   workflow_dispatch:
-permissions:
-  contents: write
-  pull-requests: write
-  statuses: write
-  actions: write
-  checks: read
+permissions: {}   # each job asks for what it needs
 concurrency:
   group: merge-queue
   cancel-in-progress: false
 jobs:
   prepare:
-    uses: Thirdline-LLC/.github/.github/workflows/merge-queue-prepare.yml@v1
+    permissions:
+      contents: write          # push the test branch
+      pull-requests: write     # read the queue, comment on the PR
+      statuses: read
+      checks: read
+      actions: write           # restart the queue after an early error
+    uses: Thirdline-LLC/.github/.github/workflows/merge-queue-prepare.yml@v2.0.0
     with:
       runs_on: ${{ vars.MERGE_QUEUE_RUNS_ON }}   # see "Choosing the runner" in the README
 
-  # This repo's required checks, run on the PR merged into the latest main.
-  checks:                      # one job per CI workflow file; name it after the file
+  # Starts this repo's CI on the test branch merge-queue/test-<pr>-<run> and waits for it.
+  wait:
     needs: prepare
     if: needs.prepare.outputs.state == 'test'
     permissions:
-      contents: read           # PR code runs here, so it gets read access only
-    uses: ./.github/workflows/checks.yml
+      actions: write           # start the CI runs, and cancel them if the queue run is cancelled
+      contents: read
+    uses: Thirdline-LLC/.github/.github/workflows/merge-queue-wait.yml@v2.0.0
     with:
-      ref: ${{ needs.prepare.outputs.test_ref }}
-    # No secrets by default. If this CI needs one, pass it by name:
-    # secrets:
-    #   EXAMPLE_TOKEN: ${{ secrets.EXAMPLE_TOKEN }}
+      test_branch: ${{ needs.prepare.outputs.test_branch }}
+      test_ref: ${{ needs.prepare.outputs.test_ref }}
+      ci_workflows: checks.yml   # change to your CI files, space-separated; each needs workflow_dispatch
+      runs_on: ${{ vars.MERGE_QUEUE_RUNS_ON }}
 
   finish:
-    needs: [prepare, checks]   # prepare plus every CI job
+    needs: [prepare, wait]
     if: always() && needs.prepare.outputs.pr != ''
-    uses: Thirdline-LLC/.github/.github/workflows/merge-queue-finish.yml@v1
+    permissions:
+      contents: write          # merge the PR, delete the test branch
+      pull-requests: write     # merge, comment, remove the label
+      statuses: write          # set the merge-queue status
+      actions: write           # start post-merge workflows and the next queue run
+      checks: read
+    uses: Thirdline-LLC/.github/.github/workflows/merge-queue-finish.yml@v2.0.0
     with:
       pr: ${{ needs.prepare.outputs.pr }}
       head_sha: ${{ needs.prepare.outputs.head_sha }}
       base_sha: ${{ needs.prepare.outputs.base_sha }}
       state: ${{ needs.prepare.outputs.state }}
-      # Only success counts: a failed, cancelled or skipped CI job is a failure.
-      test_result: ${{ (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')) && 'failure' || 'success' }}
+      # Only success counts: a failed, cancelled or skipped wait is a failure.
+      test_result: ${{ needs.wait.outputs.result == 'success' && 'success' || 'failure' }}
+      test_reason: ${{ needs.wait.outputs.reason }}
       post_merge: checks.yml   # space-separated; workflows that run on push to main
       runs_on: ${{ vars.MERGE_QUEUE_RUNS_ON }}

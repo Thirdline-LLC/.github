@@ -44,6 +44,9 @@ on:
       result:
         description: success, or failure with the reason in the run summary.
         value: ${{ jobs.wait.outputs.result }}
+      reason:
+        description: On failure, one line saying why (pass it to finish as test_reason).
+        value: ${{ jobs.wait.outputs.reason }}
 
 jobs:
   wait:
@@ -56,6 +59,7 @@ jobs:
       contents: read
     outputs:
       result: ${{ steps.run.outputs.result }}
+      reason: ${{ steps.run.outputs.reason }}
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
@@ -81,6 +85,8 @@ jobs:
             cancel_started
             echo "Merge queue CI: **failure**. $1" >> "$GITHUB_STEP_SUMMARY"
             echo "result=failure" >> "$GITHUB_OUTPUT"
+            # One line for finish's PR comment; finish cleans it again before posting.
+            printf 'reason=%s\n' "$(tr '\r\n' '  ' <<< "$1" | cut -c1-300)" >> "$GITHUB_OUTPUT"
             exit 0
           }
 
