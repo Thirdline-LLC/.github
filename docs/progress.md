@@ -1,7 +1,7 @@
 # Progress: single-use runners and a queue that stays out of main's cache
 
 Plan written 2026-11-18, revised the same day after the plan check (`omega-plan-griller`, 13
-holes). Not started: waits for Asher's "go".
+holes). Asher approved it on 2026-11-18; work has started.
 
 Both plans come from the 2026-11-16 security assessment fixes. They close two risks that PR code
 still has today:
@@ -93,11 +93,13 @@ still reach the Windows host and the LAN over the network.
       recorded. Slots per distro: `thirdline-pool` 3 (pool-1j, pool-2j, poolq-1j = 9 GB of 15),
       `tapin-ci` 4 (tapin-1j..3j, queue-1j = 12 GB of 15). If the measured peak plus Docker doesn't
       fit in `tapin-ci`, run 2 tapin slots there instead of 3, and write that down.
-- [ ] **A6a. Postgres on today's pool hosts.** Install PostgreSQL 16 and `pg-start.sh`
+- [x] **A6a. Postgres on today's pool hosts.** Install PostgreSQL 16 and `pg-start.sh`
       (`/usr/local/bin`, root-owned) in the `thirdline-pool` distro, where cclp and scholars run
       today. This lets A6 merge before the switch and keeps cclp and scholars working if A8 is
       rolled back. Done when: `pg-start.sh` brings up Postgres as `poolrun1` and `psql -c 'select 1'`
-      answers.
+      answers. **Done 2026-11-18:** PostgreSQL 16.15 installed, its always-on server disabled (nothing
+      on 5432); as `poolrun1`, `pg-start.sh` started one on a free port, `select 1` answered and
+      `create database cclp_supply_test` worked.
 - [ ] **A6. Postgres inside the job** (cclp and scholars use a `services:` container, which needs
       Docker inside the job). `runners/pg-start.sh` ships in the image and on the old pool hosts
       (A6a), outside PR control. It
